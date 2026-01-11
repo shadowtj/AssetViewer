@@ -1,0 +1,69 @@
+# Rust/ Cargo files
+target/
+**/*.rs.bk
+
+# If you use cargo's incremental compilation
+**/target/
+
+# By default, cargo install creates .crates.toml and .crates2.json in your home directory
+.crates.toml
+.crates2.json
+
+# Backup files
+*.swp
+*.swo
+*.tmp
+*~
+
+# IDE/Editor files (RustRover, JetBrains, VSCode, etc.)
+.idea/
+*.iml
+
+# MacOS files
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Optional: Node, Python, etc.
+node_modules/
+venv/
+.env
+
+# Ignore coverage, logs, test output
+coverage/
+logs/
+!src/state/logs/
+!src/logs/
+!src/logs/**
+!src/analytics/logs/
+!src/analytics/logs/**
+!src/status/logs/
+!src/status/logs/**
+!src/ui/logs/
+!src/ui/logs/**
+!tests/logs/
+!tests/logs/**
+!tests/analytics/logs/
+!tests/analytics/logs/**
+!tests/ui/logs/
+!tests/ui/logs/**
+*.log
+
+# Ignore local config
+*.local
+
+# Vendored crates directory
+vendor/
+
+# Cache files
+assets/cache/
+
+# Ignore Cargo.lock in local crates
+crates/**/Cargo.lock
+
+# User-provided splash logo
+assets/images/splash_logo.png
+
