@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Asset Viewer (Rust)</title>
+  <style>
+    body { font-family: Segoe UI, Arial, sans-serif; margin: 24px; line-height: 1.5; }
+    code, pre { background: #f4f4f4; padding: 2px 6px; border-radius: 6px; }
+    pre { padding: 12px; overflow:auto; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin: 16px 0; }
+    h1, h2, h3 { margin: 0.3em 0; }
+    ul { margin-top: 0.3em; }
+  </style>
+</head>
+<body>
+  <h1>Asset Viewer</h1>
+  <p>
+    A simple Rust desktop app that looks/behaves like a Windows Explorer-style asset browser:
+    folders on the left, files in the middle, and a preview panel on the right.
+  </p>
+
+  <div class="card">
+    <h2>What is implemented (v0.1)</h2>
+    <ul>
+      <li>Explorer-like layout (Left tree / Center list / Right preview)</li>
+      <li>Root folder selection + persistent config</li>
+      <li>Image preview (most common formats)</li>
+      <li>Basic audio waveform preview (MP3/WAV decode via Symphonia)</li>
+      <li>Export selected file (basic copy + simple sidecar heuristic)</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>Run</h2>
+    <pre>cd asset_viewer
+cargo run</pre>
+    <p>Windows helper scripts are in <code>asset_viewer\scripts\</code>.</p>
+  </div>
+
+  <div class="card">
+    <h2>Planned</h2>
+    <ul>
+      <li>Video preview (thumbnail + playback)</li>
+      <li>3D viewer (FBX/GLTF/OBJ) + drone/orbit camera</li>
+      <li>.blend preview via headless Blender render (thumbnail caching)</li>
+      <li>Dependency-aware export (textures, sidecars, referenced media)</li>
+      <li>Thumbnails, search, tags, favorites, and library views</li>
+    </ul>
+  </div>
+</body>
+</html>

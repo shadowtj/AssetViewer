@@ -1,0 +1,220 @@
+use anyhow::Context;
+use std::cmp::Ordering;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone)]
+pub struct FsEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: Option<std::time::SystemTime>,
+    pub extension: String,
+}
+
+impl FsEntry {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+pub fn list_dir_entries(dir: &Path) -> anyhow::Result<Vec<FsEntry>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("Reading dir: {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = entry.metadata()?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        
+        out.push(FsEntry {
+            name,
+            path,
+            is_dir: meta.is_dir(),
+            size: meta.len(),
+            modified: meta.modified().ok(),
+            extension,
+        });
+    }
+
+    // Default sort: dirs first, then by name
+    out.sort_by(|a, b| {
+        match (a.is_dir, b.is_dir) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        }
+    });
+
+    Ok(out)
+}
+
+#[derive(Debug, Clone)]
+pub struct DirNode {
+    pub path: PathBuf,
+    pub name: String,
+    pub children: Vec<DirNode>,
+    pub is_expanded: bool,
+    pub has_loaded: bool,
+}
+
+impl DirNode {
+    pub fn new(path: PathBuf, name: String) -> Self {
+        Self {
+            path,
+            name,
+            children: Vec::new(),
+            is_expanded: false,
+            has_loaded: false,
+        }
+    }
+
+    pub fn this_pc() -> Self {
+        let mut node = Self::new(PathBuf::from("this_pc"), "Deze pc".to_string());
+        node.has_loaded = true;
+        node.is_expanded = true;
+
+        #[cfg(target_os = "windows")]
+        {
+            for letter in b'A'..=b'Z' {
+                let drive_path = PathBuf::from(format!("{}:\\", letter as char));
+                if drive_path.exists() {
+                    node.children.push(Self::new(drive_path.clone(), format!("{}:", letter as char)));
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            node.children.push(Self::new(PathBuf::from("/"), "/".to_string()));
+        }
+
+        node
+    }
+
+    pub fn load_children(&mut self) {
+        if self.has_loaded || self.path == PathBuf::from("this_pc") {
+            return;
+        }
+
+        if let Ok(entries) = std::fs::read_dir(&self.path) {
+            let mut kids = Vec::new();
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_dir() {
+                        let path = entry.path();
+                        let name = path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.to_string_lossy().to_string());
+                        kids.push(Self::new(path, name));
+                    }
+                }
+            }
+            kids.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            self.children = kids;
+        }
+        self.has_loaded = true;
+    }
+
+    pub fn ui_render(
+        &mut self,
+        ui: &mut egui::Ui,
+        on_select: &mut dyn FnMut(&Path),
+        selected_dir: &Path,
+    ) {
+        let is_selected = &self.path == selected_dir;
+        let is_this_pc = self.path == PathBuf::from("this_pc");
+
+        let label = if is_this_pc {
+            "🖥 Deze pc".to_string()
+        } else if is_selected {
+            format!("📁 {}", self.name)
+        } else {
+            format!("  {}", self.name)
+        };
+
+        let header = egui::CollapsingHeader::new(label)
+            .id_source(&self.path)
+            .default_open(self.is_expanded);
+
+        let response = header.show(ui, |ui| {
+            if !self.has_loaded {
+                self.load_children();
+            }
+            for child in &mut self.children {
+                child.ui_render(ui, on_select, selected_dir);
+            }
+        });
+
+        if response.header_response.clicked() {
+            if !is_this_pc {
+                on_select(&self.path);
+            }
+        }
+    }
+}
+
+/// Export asset with dependency discovery.
+/// Scans for textures and sidecar files based on the primary asset stem.
+pub fn export_asset(file: &Path, target_dir: &Path, flatten: bool) -> anyhow::Result<()> {
+    fs::create_dir_all(target_dir).with_context(|| format!("Creating export dir: {}", target_dir.display()))?;
+
+    let file_name = file.file_name().ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
+    let dest = target_dir.join(file_name);
+    fs::copy(file, &dest).with_context(|| format!("Copying {} -> {}", file.display(), dest.display()))?;
+
+    let parent = file.parent().unwrap_or_else(|| Path::new("."));
+    let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    if stem.is_empty() {
+        return Ok(());
+    }
+
+    // Dependency discovery:
+    let sidecar_exts = ["png", "jpg", "jpeg", "tga", "tif", "tiff", "exr", "hdr", "mtl", "json", "txt", "bin", "dds"];
+    
+    // Direct sidecars
+    for ext in &sidecar_exts {
+        let side = parent.join(format!("{stem}.{ext}"));
+        if side.exists() && side != file {
+            let dest_side = target_dir.join(side.file_name().unwrap());
+            let _ = fs::copy(&side, &dest_side);
+        }
+        
+        // Suffix matches like _diffuse, _normal, etc.
+        let suffixes = ["_diff", "_diffuse", "_n", "_normal", "_rough", "_r", "_metal", "_m", "_ao", "_spec", "_s", "_col", "_color"];
+        for suffix in suffixes {
+            let side = parent.join(format!("{stem}{suffix}.{ext}"));
+            if side.exists() {
+                let dest_side = target_dir.join(side.file_name().unwrap());
+                let _ = fs::copy(&side, &dest_side);
+            }
+        }
+    }
+
+    // Subfolder textures
+    for sub in &["textures", "maps", "tex", "images"] {
+        let sub_dir = parent.join(sub);
+        if sub_dir.is_dir() {
+            if let Ok(entries) = fs::read_dir(sub_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if name.to_lowercase().contains(&stem.to_lowercase()) {
+                        let final_dest_dir = if flatten {
+                            target_dir.to_path_buf()
+                        } else {
+                            let d = target_dir.join(sub);
+                            fs::create_dir_all(&d).ok();
+                            d
+                        };
+                        let dest_file = final_dest_dir.join(entry.file_name());
+                        let _ = fs::copy(&p, &dest_file);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}

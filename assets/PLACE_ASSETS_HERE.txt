@@ -1,0 +1,1 @@
+Drop some test assets here (png/jpg/wav/mp3/etc) and set Root to this folder in the app.
