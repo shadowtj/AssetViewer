@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use crate::config::{AppConfig, ConfigStore};
 use crate::fs_model::{DirNode, FsEntry};
 use crate::preview::{PreviewCache, PreviewKind, PreviewUi};

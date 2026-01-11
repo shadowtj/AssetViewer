@@ -1,5 +1,7 @@
+#![allow(deprecated)]
+
 use anyhow::Context;
-use egui::{Context as EguiContext, pos2, vec2, Color32, Layout, Rect, RichText, ScrollArea, Slider, ComboBox};
+use egui::{Context as EguiContext, vec2, Color32, RichText, ScrollArea, Slider, ComboBox, TextureOptions, Layout};
 use egui_extras::RetainedImage;
 use egui_plot::{Line, Plot, PlotPoints};
 use serde::{Deserialize, Serialize};
@@ -285,15 +287,82 @@ pub struct BitWiseAnimation {
     pub looping: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BitWiseFrames {
+    Multi(Vec<Vec<u32>>),
+    Single(Vec<u32>),
+}
+
+fn deserialize_frames<'de, D>(deserializer: D) -> Result<Vec<Vec<u32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let frames = BitWiseFrames::deserialize(deserializer)?;
+    Ok(match frames {
+        BitWiseFrames::Multi(v) => v,
+        BitWiseFrames::Single(v) => vec![v],
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PointOrPoints {
+    Single([f32; 2]),
+    Multi(Vec<[f32; 2]>),
+}
+
+fn deserialize_action_points<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, Vec<[f32; 2]>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<HashMap<String, PointOrPoints>>::deserialize(deserializer)?;
+    Ok(raw.map(|map| {
+        map.into_iter()
+            .map(|(key, value)| {
+                let points = match value {
+                    PointOrPoints::Single(point) => vec![point],
+                    PointOrPoints::Multi(points) => points,
+                };
+                (key, points)
+            })
+            .collect()
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Offset2 {
+    Int([i32; 2]),
+    Float([f32; 2]),
+}
+
+fn deserialize_graph_offset<'de, D>(deserializer: D) -> Result<Option<[f32; 2]>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Offset2>::deserialize(deserializer)?;
+    Ok(raw.map(|value| match value {
+        Offset2::Int([x, y]) => [x as f32, y as f32],
+        Offset2::Float(offset) => offset,
+    }))
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BitWiseSpriteJson {
     pub id: String,
     pub width: u32,
     pub height: u32,
+    #[serde(deserialize_with = "deserialize_frames")]
     pub frames: Vec<Vec<u32>>,
+    #[serde(default)]
     pub animations: HashMap<String, BitWiseAnimation>,
-    pub graph_offset: Option<[i32; 2]>,
-    pub action_points: Option<HashMap<String, [i32; 2]>>,
+    #[serde(default, deserialize_with = "deserialize_graph_offset")]
+    pub graph_offset: Option<[f32; 2]>,
+    #[serde(default, deserialize_with = "deserialize_action_points")]
+    pub action_points: Option<HashMap<String, Vec<[f32; 2]>>>,
 }
 
 pub struct SpritePreview {
@@ -310,21 +379,31 @@ pub struct SpritePreview {
 impl SpritePreview {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let data: BitWiseSpriteJson = serde_json::from_str(&content)?;
+        let mut data: BitWiseSpriteJson = serde_json::from_str(&content)?;
+        if data.animations.is_empty() {
+            let frames: Vec<usize> = (0..data.frames.len()).collect();
+            if !frames.is_empty() {
+                data.animations.insert("Default".to_string(), BitWiseAnimation { frames, fps: 12.0, looping: true });
+            }
+        }
         let mut anim_names: Vec<String> = data.animations.keys().cloned().collect();
         anim_names.sort();
         let default_anim = anim_names.get(0).cloned().unwrap_or_else(|| "None".to_string());
         Ok(Self {
             path: path.to_path_buf(), data, selected_animation: default_anim,
             current_anim_frame_idx: 0, last_update: 0.0, use_detected_height: true,
-            is_playing: true, zoom: 4.0,
+            is_playing: false, zoom: 4.0,
         })
     }
 
     fn get_effective_height(&self, frame_idx: usize) -> u32 {
         if let Some(frame) = self.data.frames.get(frame_idx) {
-            if self.data.width > 0 && frame.len() as u32 % self.data.width == 0 {
-                return frame.len() as u32 / self.data.width;
+            if self.data.width > 0 {
+                let pixel_count = frame.len() as u32 / 4;
+                let detected = pixel_count / self.data.width;
+                if detected > 0 {
+                    return detected;
+                }
             }
         }
         self.data.height
@@ -336,12 +415,22 @@ impl SpritePreview {
         let height = if self.use_detected_height { self.get_effective_height(frame_idx) } else { self.data.height };
         if width == 0 || height == 0 { return None; }
         let mut pixels = Vec::with_capacity((width * height) as usize);
-        for i in 0..(width * height) as usize {
-            let idx = frame_data.get(i).cloned().unwrap_or(0);
-            if idx == 0 { pixels.push(Color32::TRANSPARENT); }
-            else { pixels.push(Color32::from_rgb(((idx * 37) % 255) as u8, ((idx * 59) % 255) as u8, ((idx * 83) % 255) as u8)); }
+        let total_pixels = (width * height) as usize;
+        for i in 0..total_pixels {
+            let base = i * 4;
+            let r = frame_data.get(base).copied().unwrap_or(0).min(255) as u8;
+            let g = frame_data.get(base + 1).copied().unwrap_or(0).min(255) as u8;
+            let b = frame_data.get(base + 2).copied().unwrap_or(0).min(255) as u8;
+            let a = frame_data.get(base + 3).copied().unwrap_or(0).min(255) as u8;
+            pixels.push(Color32::from_rgba_unmultiplied(r, g, b, a));
         }
-        Some(RetainedImage::from_color_image(format!("{}_f{}", self.data.id, frame_idx), egui::ColorImage { size: [width as usize, height as usize], pixels }))
+        Some(
+            RetainedImage::from_color_image(
+                format!("{}_f{}", self.data.id, frame_idx),
+                egui::ColorImage { size: [width as usize, height as usize], pixels },
+            )
+            .with_options(TextureOptions::NEAREST),
+        )
     }
 }
 
@@ -357,25 +446,42 @@ impl PreviewUi for SpritePreview {
                     for n in names { if ui.selectable_label(&self.selected_animation == n, n).clicked() { self.selected_animation = n.clone(); self.current_anim_frame_idx = 0; } }
                 });
                 ui.checkbox(&mut self.use_detected_height, "Use detected height");
+                ui.checkbox(&mut self.is_playing, "Play");
                 ui.add(Slider::new(&mut self.zoom, 1.0..=16.0).integer());
             });
             ui.separator();
             let frame_to_show = if let Some(anim) = self.data.animations.get(&self.selected_animation) {
-                if self.is_playing {
-                    let time = ui.input(|i| i.time);
-                    if time - self.last_update > (1.0 / anim.fps.max(0.1) as f64) {
-                        self.current_anim_frame_idx = (self.current_anim_frame_idx + 1) % anim.frames.len();
-                        self.last_update = time;
+                if !anim.frames.is_empty() {
+                    if self.is_playing {
+                        let time = ui.input(|i| i.time);
+                        if time - self.last_update > (1.0 / anim.fps.max(0.1) as f64) {
+                            self.current_anim_frame_idx = (self.current_anim_frame_idx + 1) % anim.frames.len();
+                            self.last_update = time;
+                        }
+                        ui.ctx().request_repaint();
                     }
-                    ui.ctx().request_repaint();
+                    anim.frames.get(self.current_anim_frame_idx).cloned().unwrap_or(0)
+                } else {
+                    0
                 }
-                anim.frames.get(self.current_anim_frame_idx).cloned().unwrap_or(0)
             } else { 0 };
             ui.vertical(|ui| {
                 ScrollArea::both().id_source("s_scroll").show(ui, |ui| {
-                    if let Some(tex) = self.render_frame_to_texture(frame_to_show) {
-                        let eff_h = if self.use_detected_height { self.get_effective_height(frame_to_show) } else { self.data.height };
-                        tex.show_size(ui, vec2(self.data.width as f32 * self.zoom, eff_h as f32 * self.zoom));
+                    if self.data.frames.is_empty() {
+                        ui.label("No frames to display.");
+                    } else {
+                        let clamped_idx = frame_to_show.min(self.data.frames.len().saturating_sub(1));
+                        if let Some(tex) = self.render_frame_to_texture(clamped_idx) {
+                            let eff_h = if self.use_detected_height { self.get_effective_height(clamped_idx) } else { self.data.height };
+                            let size = vec2(self.data.width as f32 * self.zoom, eff_h as f32 * self.zoom);
+                            let available = ui.available_size();
+                            let canvas_size = vec2(size.x.max(available.x), size.y.max(available.y));
+                            ui.allocate_ui_with_layout(canvas_size, Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
+                                tex.show_size(ui, size);
+                            });
+                        } else {
+                            ui.label("Frame index out of range.");
+                        }
                     }
                 });
             });
@@ -438,9 +544,13 @@ impl Model3DPreview {
 impl PreviewUi for Model3DPreview {
     fn ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("3D Model Info");
+        ui.label(RichText::new(self.path.to_string_lossy()).small().color(Color32::GRAY));
         if let Some(info) = &self.info {
             ui.group(|ui| {
-                ui.label(format!("Meshes: {}", info.mesh_count)); ui.label(format!("Vertices: {}", info.vertex_count));
+                ui.label(format!("Meshes: {}", info.mesh_count));
+                ui.label(format!("Materials: {}", info.material_count));
+                ui.label(format!("Vertices: {}", info.vertex_count));
+                ui.label(format!("Triangles: {}", info.triangle_count));
                 ui.separator();
                 ui.label(format!("Min: [{:.2}, {:.2}, {:.2}]", info.min_bounds[0], info.min_bounds[1], info.min_bounds[2]));
                 ui.label(format!("Max: [{:.2}, {:.2}, {:.2}]", info.max_bounds[0], info.max_bounds[1], info.max_bounds[2]));
@@ -502,11 +612,13 @@ impl VideoPreview {
 impl PreviewUi for VideoPreview {
     fn ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Video Preview");
+        let ext = if self.extension.is_empty() { "unknown" } else { &self.extension };
+        ui.label(format!("Type: {}", ext));
+        ui.label(format!("Size: {} bytes", self.file_size));
         if ui.button("🎬 Play in System Player").clicked() { let _ = open::that(&self.path); }
         if let Some(thumb) = &self.thumbnail { ScrollArea::vertical().show(ui, |ui| { thumb.show_max_size(ui, vec2(400.0, 400.0)); }); }
     }
 }
-
 // --- ZIP Preview ---
 
 pub struct ZipEntry { pub name: String, pub is_dir: bool, pub size: u64, pub children: HashMap<String, ZipEntry> }
@@ -515,6 +627,7 @@ impl ZipPreview {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let file = std::fs::File::open(path)?; let mut archive = zip::ZipArchive::new(file)?;
         let mut root = ZipEntry { name: "/".into(), is_dir: true, size: 0, children: HashMap::new() };
+        let mut total_size = 0u64;
         for i in 0..archive.len() {
             let file = archive.by_index(i)?; let parts: Vec<&str> = file.name().split('/').filter(|s| !s.is_empty()).collect();
             let mut current = &mut root;
@@ -522,17 +635,23 @@ impl ZipPreview {
                 let is_last = idx == parts.len() - 1;
                 current = current.children.entry(part.to_string()).or_insert_with(|| ZipEntry { name: part.to_string(), is_dir: !is_last || file.is_dir(), size: if is_last { file.size() } else { 0 }, children: HashMap::new() });
             }
+            if !file.is_dir() {
+                total_size = total_size.saturating_add(file.size());
+            }
         }
-        Ok(Self { root, file_count: archive.len(), total_size: 0 })
+        Ok(Self { root, file_count: archive.len(), total_size })
     }
     fn render_entry(ui: &mut egui::Ui, entry: &ZipEntry) {
         if entry.is_dir { ui.collapsing(format!("📁 {}", entry.name), |ui| { let mut keys: Vec<_> = entry.children.keys().collect(); keys.sort(); for k in keys { Self::render_entry(ui, &entry.children[k]); } }); }
-        else { ui.label(format!("📄 {}", entry.name)); }
+        else { ui.label(format!("📄 {} ({} bytes)", entry.name, entry.size)); }
     }
 }
 impl PreviewUi for ZipPreview {
     fn ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("ZIP Archive"); ScrollArea::vertical().id_source("z").show(ui, |ui| { let mut keys: Vec<_> = self.root.children.keys().collect(); keys.sort(); for k in keys { Self::render_entry(ui, &self.root.children[k]); } });
+        ui.heading("ZIP Archive");
+        ui.label(format!("Files: {}", self.file_count));
+        ui.label(format!("Total size: {} bytes", self.total_size));
+        ScrollArea::vertical().id_source("z").show(ui, |ui| { let mut keys: Vec<_> = self.root.children.keys().collect(); keys.sort(); for k in keys { Self::render_entry(ui, &self.root.children[k]); } });
     }
 }
 
@@ -540,7 +659,7 @@ impl PreviewUi for ZipPreview {
 
 pub struct TextPreview { pub path: PathBuf, pub content: String }
 impl TextPreview { pub fn load(path: &Path) -> anyhow::Result<Self> { Ok(Self { path: path.to_path_buf(), content: std::fs::read_to_string(path)? }) } }
-impl PreviewUi for TextPreview { fn ui(&mut self, ui: &mut egui::Ui) { ui.heading("Text"); ScrollArea::both().show(ui, |ui| { ui.add(egui::TextEdit::multiline(&mut self.content).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY)); }); } }
+impl PreviewUi for TextPreview { fn ui(&mut self, ui: &mut egui::Ui) { ui.heading("Text"); ui.label(RichText::new(self.path.to_string_lossy()).small().color(Color32::GRAY)); ScrollArea::both().show(ui, |ui| { ui.add(egui::TextEdit::multiline(&mut self.content).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY)); }); } }
 
 // --- Stub Preview ---
 
