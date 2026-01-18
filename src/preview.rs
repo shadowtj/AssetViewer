@@ -100,6 +100,16 @@ impl PreviewUi for ImagePreview {
         });
 
         ui.add_space(6.0);
+
+        // Handle mouse wheel zoom
+        if ui.rect_contains_pointer(ui.max_rect()) {
+            let delta = ui.input(|i| i.smooth_scroll_delta.y);
+            if delta != 0.0 {
+                let zoom_factor = (delta / 200.0).exp();
+                self.zoom = (self.zoom * zoom_factor).clamp(0.1, 8.0);
+            }
+        }
+
         ScrollArea::both()
             .id_source("image_preview_scroll")
             .auto_shrink([false; 2])
@@ -448,6 +458,15 @@ impl PreviewUi for SpritePreview {
                 ui.checkbox(&mut self.use_detected_height, "Use detected height");
                 ui.checkbox(&mut self.is_playing, "Play");
                 ui.add(Slider::new(&mut self.zoom, 1.0..=16.0).integer());
+
+                // Handle mouse wheel zoom
+                if ui.rect_contains_pointer(ui.max_rect()) {
+                    let delta = ui.input(|i| i.smooth_scroll_delta.y);
+                    if delta != 0.0 {
+                        let zoom_factor = (delta / 200.0).exp();
+                        self.zoom = (self.zoom * zoom_factor).clamp(1.0, 16.0);
+                    }
+                }
             });
             ui.separator();
             let frame_to_show = if let Some(anim) = self.data.animations.get(&self.selected_animation) {

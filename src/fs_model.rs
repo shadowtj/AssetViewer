@@ -77,10 +77,22 @@ impl DirNode {
 
         #[cfg(target_os = "windows")]
         {
+            let drive_labels = get_drive_labels();
             for letter in b'A'..=b'Z' {
-                let drive_path = PathBuf::from(format!("{}:\\", letter as char));
+                let letter_char = letter as char;
+                let drive_path = PathBuf::from(format!("{}:\\", letter_char));
                 if drive_path.exists() {
-                    node.children.push(Self::new(drive_path.clone(), format!("{}:", letter as char)));
+                    let drive_id = format!("{}:", letter_char);
+                    let name = if let Some(label) = drive_labels.get(&drive_id) {
+                        if label.is_empty() {
+                            drive_id
+                        } else {
+                            format!("{} ({})", label, drive_id)
+                        }
+                    } else {
+                        drive_id
+                    };
+                    node.children.push(Self::new(drive_path.clone(), name));
                 }
             }
         }
@@ -217,4 +229,28 @@ pub fn export_asset(file: &Path, target_dir: &Path, flatten: bool) -> anyhow::Re
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn get_drive_labels() -> std::collections::HashMap<String, String> {
+    let mut labels = std::collections::HashMap::new();
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_LogicalDisk | ForEach-Object { $_.DeviceID + '|' + $_.VolumeName }",
+        ])
+        .output();
+
+    if let Ok(output) = output {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let line = line.trim();
+            if let Some((id, label)) = line.split_once('|') {
+                // id is like "C:", label might be empty
+                labels.insert(id.to_uppercase(), label.trim().to_string());
+            }
+        }
+    }
+    labels
 }
