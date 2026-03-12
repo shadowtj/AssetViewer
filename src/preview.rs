@@ -76,6 +76,7 @@ impl PreviewUi for Preview {
 // --- Image Preview ---
 
 pub struct ImagePreview {
+    pub path: PathBuf,
     image: RetainedImage,
     zoom: f32,
 }
@@ -85,38 +86,52 @@ impl ImagePreview {
         let bytes = std::fs::read(path).with_context(|| format!("Reading image: {}", path.display()))?;
         let image = RetainedImage::from_image_bytes(path.to_string_lossy(), &bytes)
             .map_err(|err| anyhow::anyhow!(err))?;
-        Ok(Self { image, zoom: 1.0 })
+        Ok(Self { path: path.to_path_buf(), image, zoom: 1.0 })
     }
 }
 
 impl PreviewUi for ImagePreview {
     fn ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Zoom");
-            ui.add(Slider::new(&mut self.zoom, 0.1..=8.0).logarithmic(true));
-            if ui.button("📸 Screenshot").clicked() {
-                let _ = rfd::FileDialog::new().add_filter("PNG", &["png"]).save_file();
-            }
-        });
-
-        ui.add_space(6.0);
+        ui.heading("Design Tools");
 
         // Handle mouse wheel zoom
         if ui.rect_contains_pointer(ui.max_rect()) {
             let delta = ui.input(|i| i.smooth_scroll_delta.y);
             if delta != 0.0 {
                 let zoom_factor = (delta / 200.0).exp();
-                self.zoom = (self.zoom * zoom_factor).clamp(0.1, 8.0);
+                self.zoom = (self.zoom * zoom_factor).clamp(0.1, 32.0);
             }
         }
+
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label("Zoom:");
+                ui.add(Slider::new(&mut self.zoom, 0.1..=32.0).logarithmic(true));
+                if ui.button("Reset").clicked() { self.zoom = 1.0; }
+                if ui.button("📸 Screenshot").clicked() {
+                    let _ = rfd::FileDialog::new().add_filter("PNG", &["png"]).save_file();
+                }
+            });
+        });
+
+        ui.add_space(8.0);
 
         ScrollArea::both()
             .id_source("image_preview_scroll")
             .auto_shrink([false; 2])
+            .max_height(ui.available_height() - 100.0) // Leave space for info
             .show(ui, |ui| {
                 let size = self.image.size_vec2() * self.zoom;
                 self.image.show_size(ui, size);
             });
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.heading("Asset Info");
+        ui.group(|ui| {
+            ui.label(format!("Dimensions: {}x{}", self.image.width(), self.image.height()));
+            ui.label(RichText::new(self.path.to_string_lossy()).small().color(Color32::GRAY));
+        });
     }
 }
 
@@ -446,75 +461,130 @@ impl SpritePreview {
 
 impl PreviewUi for SpritePreview {
     fn ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading(format!("Sprite: {}", self.data.id));
-        ui.label(RichText::new(self.path.to_string_lossy()).small().color(Color32::GRAY));
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.group(|ui| { ui.label(format!("Size: {}x{}", self.data.width, self.data.height)); ui.label(format!("Frames: {}", self.data.frames.len())); });
-                ComboBox::from_id_source("s_anim").selected_text(&self.selected_animation).show_ui(ui, |ui| {
-                    let mut names: Vec<_> = self.data.animations.keys().collect(); names.sort();
-                    for n in names { if ui.selectable_label(&self.selected_animation == n, n).clicked() { self.selected_animation = n.clone(); self.current_anim_frame_idx = 0; } }
-                });
-                ui.checkbox(&mut self.use_detected_height, "Use detected height");
-                ui.checkbox(&mut self.is_playing, "Play");
-                ui.add(Slider::new(&mut self.zoom, 1.0..=16.0).integer());
+        ui.heading("Design Tools");
 
-                // Handle mouse wheel zoom
-                if ui.rect_contains_pointer(ui.max_rect()) {
-                    let delta = ui.input(|i| i.smooth_scroll_delta.y);
-                    if delta != 0.0 {
-                        let zoom_factor = (delta / 200.0).exp();
-                        self.zoom = (self.zoom * zoom_factor).clamp(1.0, 16.0);
-                    }
+        // Handle mouse wheel zoom
+        if ui.rect_contains_pointer(ui.max_rect()) {
+            let delta = ui.input(|i| i.smooth_scroll_delta.y);
+            if delta != 0.0 {
+                let zoom_factor = (delta / 200.0).exp();
+                self.zoom = (self.zoom * zoom_factor).clamp(0.1, 64.0);
+            }
+        }
+
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                if ui.button(if self.is_playing { "⏸ Pause" } else { "▶ Play" }).clicked() {
+                    self.is_playing = !self.is_playing;
                 }
+                ui.separator();
+                ui.label("Zoom:");
+                ui.add(Slider::new(&mut self.zoom, 0.1..=64.0).logarithmic(true));
+                if ui.button("Reset").clicked() { self.zoom = 4.0; }
             });
-            ui.separator();
-            let frame_to_show = if let Some(anim) = self.data.animations.get(&self.selected_animation) {
-                if !anim.frames.is_empty() {
-                    if self.is_playing {
-                        let time = ui.input(|i| i.time);
-                        if time - self.last_update > (1.0 / anim.fps.max(0.1) as f64) {
-                            self.current_anim_frame_idx = (self.current_anim_frame_idx + 1) % anim.frames.len();
-                            self.last_update = time;
+            ui.horizontal(|ui| {
+                ui.label("Animation:");
+                ComboBox::from_id_source("s_anim")
+                    .selected_text(&self.selected_animation)
+                    .show_ui(ui, |ui| {
+                        let mut names: Vec<_> = self.data.animations.keys().collect();
+                        names.sort();
+                        for n in names {
+                            if ui.selectable_label(&self.selected_animation == n, n).clicked() {
+                                self.selected_animation = n.clone();
+                                self.current_anim_frame_idx = 0;
+                            }
                         }
-                        ui.ctx().request_repaint();
+                    });
+                ui.checkbox(&mut self.use_detected_height, "Auto Height");
+            });
+        });
+
+        ui.add_space(8.0);
+
+        let frame_to_show = if let Some(anim) = self.data.animations.get(&self.selected_animation) {
+            if !anim.frames.is_empty() {
+                if self.is_playing {
+                    let time = ui.input(|i| i.time);
+                    if time - self.last_update > (1.0 / anim.fps.max(0.1) as f64) {
+                        self.current_anim_frame_idx = (self.current_anim_frame_idx + 1) % anim.frames.len();
+                        self.last_update = time;
                     }
-                    anim.frames.get(self.current_anim_frame_idx).cloned().unwrap_or(0)
+                    ui.ctx().request_repaint();
+                }
+                anim.frames.get(self.current_anim_frame_idx).cloned().unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        ScrollArea::both()
+            .id_source("sprite_preview_scroll")
+            .auto_shrink([false; 2])
+            .max_height(ui.available_height() - 120.0) // Leave space for info
+            .show(ui, |ui| {
+                if self.data.frames.is_empty() {
+                    ui.label("No frames to display.");
                 } else {
-                    0
-                }
-            } else { 0 };
-            ui.vertical(|ui| {
-                ScrollArea::both().id_source("s_scroll").show(ui, |ui| {
-                    if self.data.frames.is_empty() {
-                        ui.label("No frames to display.");
-                    } else {
-                        let clamped_idx = frame_to_show.min(self.data.frames.len().saturating_sub(1));
-                        if let Some(tex) = self.render_frame_to_texture(clamped_idx) {
-                            let eff_h = if self.use_detected_height { self.get_effective_height(clamped_idx) } else { self.data.height };
-                            let size = vec2(self.data.width as f32 * self.zoom, eff_h as f32 * self.zoom);
-                            let available = ui.available_size();
-                            let canvas_size = vec2(size.x.max(available.x), size.y.max(available.y));
-                            ui.allocate_ui_with_layout(canvas_size, Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
-                                tex.show_size(ui, size);
-                            });
+                    let clamped_idx = frame_to_show.min(self.data.frames.len().saturating_sub(1));
+                    if let Some(tex) = self.render_frame_to_texture(clamped_idx) {
+                        let eff_h = if self.use_detected_height {
+                            self.get_effective_height(clamped_idx)
                         } else {
-                            ui.label("Frame index out of range.");
-                        }
+                            self.data.height
+                        };
+                        let size = vec2(self.data.width as f32 * self.zoom, eff_h as f32 * self.zoom);
+                        
+                        // Use centered and justified layout within the scroll area
+                        let available = ui.available_size();
+                        let canvas_size = vec2(size.x.max(available.x), size.y.max(available.y));
+                        ui.allocate_ui_with_layout(
+                            canvas_size,
+                            Layout::centered_and_justified(egui::Direction::LeftToRight),
+                            |ui| {
+                                tex.show_size(ui, size);
+                            },
+                        );
+                    } else {
+                        ui.label("Failed to render frame.");
                     }
-                });
+                }
             });
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.heading("Asset Info");
+        ui.group(|ui| {
+            ui.label(format!("ID: {}", self.data.id));
+            ui.label(format!("Resolution: {}x{}", self.data.width, self.data.height));
+            ui.label(format!("Total Frames: {}", self.data.frames.len()));
+            ui.label(RichText::new(self.path.to_string_lossy()).small().color(Color32::GRAY));
         });
     }
 }
 
 // --- 3D Model Preview ---
 
-pub struct Model3DPreview { path: PathBuf, info: Option<ModelInfo>, error: Option<String> }
+pub struct Model3DPreview {
+    path: PathBuf,
+    info: Option<ModelInfo>,
+    error: Option<String>,
+    // Design Tools
+    rotation: [f32; 3],
+    scale: f32,
+}
 struct ModelInfo { mesh_count: usize, material_count: usize, vertex_count: usize, triangle_count: usize, min_bounds: [f32; 3], max_bounds: [f32; 3], meshes: Vec<String> }
 impl Model3DPreview {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let mut preview = Self { path: path.to_path_buf(), info: None, error: None };
+        let mut preview = Self {
+            path: path.to_path_buf(),
+            info: None,
+            error: None,
+            rotation: [0.0, 0.0, 0.0],
+            scale: 1.0,
+        };
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
         if ext == "obj" {
             match tobj::load_obj(path, &tobj::LoadOptions { single_index: true, triangulate: true, ..Default::default() }) {
@@ -562,8 +632,41 @@ impl Model3DPreview {
 }
 impl PreviewUi for Model3DPreview {
     fn ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("3D Model Info");
+        ui.heading("Design Tools");
+        
+        // Handle mouse wheel scale
+        if ui.rect_contains_pointer(ui.max_rect()) {
+            let delta = ui.input(|i| i.smooth_scroll_delta.y);
+            if delta != 0.0 {
+                let zoom_factor = (delta / 200.0).exp();
+                self.scale = (self.scale * zoom_factor).clamp(0.01, 100.0);
+            }
+        }
+
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label("Rotation:");
+                ui.add(egui::DragValue::new(&mut self.rotation[0]).speed(1.0).prefix("X: "));
+                ui.add(egui::DragValue::new(&mut self.rotation[1]).speed(1.0).prefix("Y: "));
+                ui.add(egui::DragValue::new(&mut self.rotation[2]).speed(1.0).prefix("Z: "));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Scale:   ");
+                ui.add(Slider::new(&mut self.scale, 0.01..=10.0).logarithmic(true));
+                if ui.button("Reset").clicked() {
+                    self.rotation = [0.0, 0.0, 0.0];
+                    self.scale = 1.0;
+                }
+            });
+        });
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(4.0);
+        
+        ui.heading("Asset Info");
         ui.label(RichText::new(self.path.to_string_lossy()).small().color(Color32::GRAY));
+        
         if let Some(info) = &self.info {
             ui.group(|ui| {
                 ui.label(format!("Meshes: {}", info.mesh_count));
@@ -620,22 +723,151 @@ impl PreviewUi for BlendPreview {
 
 // --- Video Preview ---
 
-pub struct VideoPreview { path: PathBuf, thumbnail: Option<RetainedImage>, file_size: u64, extension: String }
+pub struct VideoPreview {
+    path: PathBuf,
+    file_size: u64,
+    
+    // Playback state
+    texture: Option<RetainedImage>,
+    current_time: f64,
+    duration: f64,
+    is_playing: bool,
+    last_frame_update: Instant,
+    
+    // Info
+    width: u32,
+    height: u32,
+}
+
 impl VideoPreview {
     pub fn load(path: &Path, _ctx: &EguiContext) -> anyhow::Result<Self> {
-        let meta = std::fs::metadata(path)?; let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-        let mut thumbnail = None; if ext == "gif" { if let Ok(bytes) = std::fs::read(path) { thumbnail = RetainedImage::from_image_bytes(path.to_string_lossy(), &bytes).ok(); } }
-        Ok(Self { path: path.to_path_buf(), thumbnail, file_size: meta.len(), extension: ext })
+        let meta = std::fs::metadata(path)?;
+        
+        // Get duration and resolution using ffprobe
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v", "error",
+                "-show_entries", "format=duration:stream=width,height",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                &path.to_string_lossy(),
+            ])
+            .output()?;
+            
+        let out_str = String::from_utf8_lossy(&output.stdout);
+        let mut lines = out_str.lines();
+        let width: u32 = lines.next().unwrap_or("0").parse().unwrap_or(0);
+        let height: u32 = lines.next().unwrap_or("0").parse().unwrap_or(0);
+        let duration: f64 = lines.next().unwrap_or("0").parse().unwrap_or(0.0);
+
+        let mut preview = Self {
+            path: path.to_path_buf(),
+            file_size: meta.len(),
+            texture: None,
+            current_time: 0.0,
+            duration,
+            is_playing: false,
+            last_frame_update: Instant::now(),
+            width,
+            height,
+        };
+        
+        // Load first frame
+        preview.extract_frame(0.0);
+        
+        Ok(preview)
+    }
+
+    fn extract_frame(&mut self, timestamp: f64) {
+        let output = std::process::Command::new("ffmpeg")
+            .args([
+                "-ss", &timestamp.to_string(),
+                "-i", &self.path.to_string_lossy(),
+                "-frames:v", "1",
+                "-f", "image2",
+                "-vcodec", "mjpeg",
+                "pipe:1",
+            ])
+            .output();
+
+        if let Ok(output) = output {
+            if let Ok(image) = RetainedImage::from_image_bytes(
+                format!("{}_{}", self.path.display(), timestamp),
+                &output.stdout
+            ) {
+                self.texture = Some(image);
+            }
+        }
     }
 }
+
 impl PreviewUi for VideoPreview {
     fn ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Video Preview");
-        let ext = if self.extension.is_empty() { "unknown" } else { &self.extension };
-        ui.label(format!("Type: {}", ext));
-        ui.label(format!("Size: {} bytes", self.file_size));
-        if ui.button("🎬 Play in System Player").clicked() { let _ = open::that(&self.path); }
-        if let Some(thumb) = &self.thumbnail { ScrollArea::vertical().show(ui, |ui| { thumb.show_max_size(ui, vec2(400.0, 400.0)); }); }
+        ui.heading("Design Tools");
+
+        if self.is_playing {
+            let now = Instant::now();
+            let elapsed = now.duration_since(self.last_frame_update).as_secs_f64();
+            if elapsed > 0.1 { // ~10 FPS for the preview
+                self.current_time += elapsed;
+                if self.current_time > self.duration {
+                    self.current_time = 0.0;
+                }
+                self.extract_frame(self.current_time);
+                self.last_frame_update = now;
+            }
+            ui.ctx().request_repaint();
+        }
+
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                if ui.button(if self.is_playing { "⏸ Pause" } else { "▶ Play" }).clicked() {
+                    self.is_playing = !self.is_playing;
+                    self.last_frame_update = Instant::now();
+                }
+                
+                if ui.button("⏹ Stop").clicked() {
+                    self.is_playing = false;
+                    self.current_time = 0.0;
+                    self.extract_frame(0.0);
+                }
+
+                let mut seek = self.current_time;
+                if ui.add(Slider::new(&mut seek, 0.0..=self.duration).show_value(false)).changed() {
+                    self.current_time = seek;
+                    self.extract_frame(self.current_time);
+                    self.is_playing = false;
+                }
+                
+                ui.label(format!("{:.1}s / {:.1}s", self.current_time, self.duration));
+            });
+        });
+
+        ui.add_space(8.0);
+        
+        if let Some(tex) = &self.texture {
+            let available_width = ui.available_width();
+            let aspect = self.width as f32 / self.height as f32;
+            let draw_size = vec2(available_width, available_width / aspect);
+            
+            ScrollArea::vertical()
+                .id_source("vid_scroll")
+                .max_height(ui.available_height() - 120.0)
+                .show(ui, |ui| {
+                    tex.show_size(ui, draw_size);
+                });
+        }
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.heading("Asset Info");
+        ui.group(|ui| {
+            ui.label(format!("Resolution: {}x{}", self.width, self.height));
+            ui.label(format!("Size: {:.2} MB", self.file_size as f64 / 1_048_576.0));
+            ui.label(RichText::new(self.path.to_string_lossy()).small().color(Color32::GRAY));
+            if ui.button("🎬 Open in System Player").clicked() {
+                let _ = open::that(&self.path);
+            }
+        });
     }
 }
 // --- ZIP Preview ---
