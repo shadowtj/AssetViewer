@@ -295,7 +295,7 @@ impl AssetViewerApp {
             ui.horizontal(|ui| {
                 ui.label("📍");
                 let response = ui.add(egui::TextEdit::singleline(&mut self.address_bar).desired_width(f32::INFINITY));
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if response.lost_focus() && (ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                     let new_path = PathBuf::from(&self.address_bar);
                     if new_path.exists() {
                         if new_path.is_dir() {
