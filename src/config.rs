@@ -59,7 +59,8 @@ impl ConfigStore {
         if !self.path.exists() {
             return Ok(AppConfig::default());
         }
-        let raw = fs::read_to_string(&self.path).with_context(|| format!("Reading config: {}", self.path.display()))?;
+        let raw = fs::read_to_string(&self.path)
+            .with_context(|| format!("Reading config: {}", self.path.display()))?;
         let cfg: AppConfig = serde_json::from_str(&raw).with_context(|| "Parsing config JSON")?;
         Ok(cfg)
     }
@@ -69,7 +70,8 @@ impl ConfigStore {
             fs::create_dir_all(parent).ok();
         }
         let raw = serde_json::to_string_pretty(config)?;
-        fs::write(&self.path, raw).with_context(|| format!("Writing config: {}", self.path.display()))?;
+        fs::write(&self.path, raw)
+            .with_context(|| format!("Writing config: {}", self.path.display()))?;
         Ok(())
     }
 }

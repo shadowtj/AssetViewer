@@ -26,8 +26,12 @@ pub fn list_dir_entries(dir: &Path) -> anyhow::Result<Vec<FsEntry>> {
         let path = entry.path();
         let meta = entry.metadata()?;
         let name = entry.file_name().to_string_lossy().to_string();
-        let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-        
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
         out.push(FsEntry {
             name,
             path,
@@ -39,12 +43,10 @@ pub fn list_dir_entries(dir: &Path) -> anyhow::Result<Vec<FsEntry>> {
     }
 
     // Default sort: dirs first, then by name
-    out.sort_by(|a, b| {
-        match (a.is_dir, b.is_dir) {
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        }
+    out.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
 
     Ok(out)
@@ -98,7 +100,8 @@ impl DirNode {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            node.children.push(Self::new(PathBuf::from("/"), "/".to_string()));
+            node.children
+                .push(Self::new(PathBuf::from("/"), "/".to_string()));
         }
 
         node
@@ -170,11 +173,15 @@ impl DirNode {
 /// Export asset with dependency discovery.
 /// Scans for textures and sidecar files based on the primary asset stem.
 pub fn export_asset(file: &Path, target_dir: &Path, flatten: bool) -> anyhow::Result<()> {
-    fs::create_dir_all(target_dir).with_context(|| format!("Creating export dir: {}", target_dir.display()))?;
+    fs::create_dir_all(target_dir)
+        .with_context(|| format!("Creating export dir: {}", target_dir.display()))?;
 
-    let file_name = file.file_name().ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
+    let file_name = file
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
     let dest = target_dir.join(file_name);
-    fs::copy(file, &dest).with_context(|| format!("Copying {} -> {}", file.display(), dest.display()))?;
+    fs::copy(file, &dest)
+        .with_context(|| format!("Copying {} -> {}", file.display(), dest.display()))?;
 
     let parent = file.parent().unwrap_or_else(|| Path::new("."));
     let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -183,8 +190,11 @@ pub fn export_asset(file: &Path, target_dir: &Path, flatten: bool) -> anyhow::Re
     }
 
     // Dependency discovery:
-    let sidecar_exts = ["png", "jpg", "jpeg", "tga", "tif", "tiff", "exr", "hdr", "mtl", "json", "txt", "bin", "dds"];
-    
+    let sidecar_exts = [
+        "png", "jpg", "jpeg", "tga", "tif", "tiff", "exr", "hdr", "mtl", "json", "txt", "bin",
+        "dds",
+    ];
+
     // Direct sidecars
     for ext in &sidecar_exts {
         let side = parent.join(format!("{stem}.{ext}"));
@@ -192,9 +202,12 @@ pub fn export_asset(file: &Path, target_dir: &Path, flatten: bool) -> anyhow::Re
             let dest_side = target_dir.join(side.file_name().unwrap());
             let _ = fs::copy(&side, &dest_side);
         }
-        
+
         // Suffix matches like _diffuse, _normal, etc.
-        let suffixes = ["_diff", "_diffuse", "_n", "_normal", "_rough", "_r", "_metal", "_m", "_ao", "_spec", "_s", "_col", "_color"];
+        let suffixes = [
+            "_diff", "_diffuse", "_n", "_normal", "_rough", "_r", "_metal", "_m", "_ao", "_spec",
+            "_s", "_col", "_color",
+        ];
         for suffix in suffixes {
             let side = parent.join(format!("{stem}{suffix}.{ext}"));
             if side.exists() {

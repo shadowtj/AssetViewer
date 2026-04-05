@@ -8,7 +8,11 @@ egui_extras = { version = "0.27", features = ["image", "all_loaders"] }
 eframe = "0.27"
 egui = "0.27"
 egui_plot = "0.27"
-image = { version = "0.24.9", features = ["jpeg", "png"] }
+image = { version = "0.25.9", features = ["jpeg", "png"] }
+pdfium = "0.10.3"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+flate2 = "1"
+tar = "0.4"
 
 walkdir = "2.5"
 rfd = "0.14"
@@ -19,7 +23,11 @@ symphonia = { version = "0.5", features = ["mp3", "wav"] }
 rodio = "0.19"
 easy-gltf = "1.1"
 tobj = "4.0"
+stl_io = "0.8"
+fontdue = "0.9"
 open = "5.3"
 zip = "0.6"
+sevenz-rust2 = "0.20"
+unrar = "0.5"
 anyhow = "1.0"
 thiserror = "1.0"

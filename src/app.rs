@@ -27,6 +27,8 @@ pub struct AssetViewerApp {
     root_path: PathBuf,
     tree: DirNode,
     selected_dir: PathBuf,
+    dir_history: Vec<PathBuf>,
+    dir_history_index: usize,
     entries: Vec<FsEntry>,
     filtered_entries: Vec<FsEntry>,
     selected_file: Option<PathBuf>,
@@ -46,9 +48,13 @@ pub struct AssetViewerApp {
     sort_ascending: bool,
     view_mode: ViewMode,
     thumbnail_cache: std::collections::HashMap<PathBuf, egui_extras::RetainedImage>,
+    thumbnail_rx: Option<std::sync::mpsc::Receiver<(PathBuf, Vec<u8>, String)>>,
 
     // Audio output
     _audio_stream: Option<(rodio::OutputStream, rodio::OutputStreamHandle)>,
+
+    // Stored context for background threads
+    ctx: egui::Context,
 }
 
 impl AssetViewerApp {
@@ -78,7 +84,9 @@ impl AssetViewerApp {
             config,
             root_path,
             tree,
-            selected_dir,
+            selected_dir: selected_dir.clone(),
+            dir_history: vec![selected_dir.clone()],
+            dir_history_index: 0,
             entries,
             filtered_entries: Vec::new(),
             selected_file: None,
@@ -93,7 +101,9 @@ impl AssetViewerApp {
             sort_ascending: true,
             view_mode: ViewMode::List,
             thumbnail_cache: std::collections::HashMap::new(),
+            thumbnail_rx: None,
             _audio_stream: audio_stream,
+            ctx: cc.egui_ctx.clone(),
         };
         app.load_thumbnails();
         app.apply_filters();
@@ -104,6 +114,8 @@ impl AssetViewerApp {
         self.root_path = new_root;
         self.selected_dir = self.root_path.clone();
         self.address_bar = self.selected_dir.to_string_lossy().to_string();
+        self.dir_history = vec![self.selected_dir.clone()];
+        self.dir_history_index = 0;
         self.refresh_selected_dir();
         self.selected_file = None;
 
@@ -155,26 +167,48 @@ impl AssetViewerApp {
     }
 
     fn load_thumbnails(&mut self) {
-        // Simple synchronous thumbnail loader for images
-        for entry in &self.entries {
-            if !entry.is_dir && !self.thumbnail_cache.contains_key(&entry.path) {
-                let kind = crate::preview::PreviewKind::from_path(&entry.path);
-                if kind == crate::preview::PreviewKind::Image {
-                    if let Ok(bytes) = std::fs::read(&entry.path) {
-                        if let Ok(image) = egui_extras::RetainedImage::from_image_bytes(entry.name.clone(), &bytes) {
-                            self.thumbnail_cache.insert(entry.path.clone(), image);
-                        }
+        // Cancel any in-flight thumbnail load for the previous directory
+        self.thumbnail_rx = None;
+
+        let paths_to_load: Vec<(PathBuf, String)> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                !e.is_dir
+                    && !self.thumbnail_cache.contains_key(&e.path)
+                    && crate::preview::PreviewKind::from_path(&e.path)
+                        == crate::preview::PreviewKind::Image
+            })
+            .map(|e| (e.path.clone(), e.name.clone()))
+            .collect();
+
+        if paths_to_load.is_empty() {
+            return;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel::<(PathBuf, Vec<u8>, String)>();
+        self.thumbnail_rx = Some(rx);
+
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            for (path, name) in paths_to_load {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if tx.send((path, bytes, name)).is_err() {
+                        break;
                     }
+                    ctx.request_repaint();
                 }
             }
-        }
+        });
     }
 
     fn apply_filters(&mut self) {
         let query = self.search_query.to_lowercase();
         let query_parts: Vec<&str> = query.split_whitespace().collect();
 
-        let mut filtered: Vec<FsEntry> = self.entries.iter()
+        let mut filtered: Vec<FsEntry> = self
+            .entries
+            .iter()
             .filter(|e| {
                 if query_parts.is_empty() {
                     true
@@ -185,7 +219,9 @@ impl AssetViewerApp {
                     if query_parts.len() > 1 && query_parts.iter().any(|&p| e.extension == p) {
                         true
                     } else {
-                        query_parts.iter().all(|&p| name_lower.contains(p) || e.extension == p)
+                        query_parts
+                            .iter()
+                            .all(|&p| name_lower.contains(p) || e.extension == p)
                     }
                 }
             })
@@ -199,17 +235,19 @@ impl AssetViewerApp {
                 SortMode::Date => a.modified.cmp(&b.modified),
                 SortMode::Size => a.size.cmp(&b.size),
             };
-            if self.sort_ascending { ord } else { ord.reverse() }
+            if self.sort_ascending {
+                ord
+            } else {
+                ord.reverse()
+            }
         });
 
         // Always keep directories first if sorting by name or type
         if self.sort_mode == SortMode::Name || self.sort_mode == SortMode::Type {
-            filtered.sort_by(|a, b| {
-                match (a.is_dir, b.is_dir) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    _ => std::cmp::Ordering::Equal,
-                }
+            filtered.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
             });
         }
 
@@ -220,7 +258,58 @@ impl AssetViewerApp {
         self.selected_dir = dir;
         self.address_bar = self.selected_dir.to_string_lossy().to_string();
         self.selected_file = None;
+        if self
+            .dir_history
+            .get(self.dir_history_index)
+            .map(|current| current != &self.selected_dir)
+            .unwrap_or(true)
+        {
+            self.dir_history.truncate(self.dir_history_index + 1);
+            self.dir_history.push(self.selected_dir.clone());
+            self.dir_history_index = self.dir_history.len().saturating_sub(1);
+        }
         self.refresh_selected_dir();
+    }
+
+    fn go_back(&mut self) -> bool {
+        if self.dir_history_index == 0 {
+            return false;
+        }
+        self.dir_history_index -= 1;
+        if let Some(dir) = self.dir_history.get(self.dir_history_index).cloned() {
+            self.selected_dir = dir;
+            self.address_bar = self.selected_dir.to_string_lossy().to_string();
+            self.selected_file = None;
+            self.refresh_selected_dir();
+            return true;
+        }
+        false
+    }
+
+    fn go_forward(&mut self) -> bool {
+        if self.dir_history_index + 1 >= self.dir_history.len() {
+            return false;
+        }
+        self.dir_history_index += 1;
+        if let Some(dir) = self.dir_history.get(self.dir_history_index).cloned() {
+            self.selected_dir = dir;
+            self.address_bar = self.selected_dir.to_string_lossy().to_string();
+            self.selected_file = None;
+            self.refresh_selected_dir();
+            return true;
+        }
+        false
+    }
+
+    fn handle_mouse_navigation(&mut self, ctx: &Context) {
+        ctx.input(|i| {
+            if i.pointer.button_pressed(egui::PointerButton::Extra1) {
+                let _ = self.go_back();
+            }
+            if i.pointer.button_pressed(egui::PointerButton::Extra2) {
+                let _ = self.go_forward();
+            }
+        });
     }
 
     fn select_file(&mut self, file: PathBuf) {
@@ -249,15 +338,19 @@ impl AssetViewerApp {
                 // Favorites Dropdown
                 egui::ComboBox::from_id_source("fav_combo")
                     .selected_text(
-                        self.config.last_favorite_index
+                        self.config
+                            .last_favorite_index
                             .and_then(|i| self.config.favorites.get(i))
                             .map(|f| f.name.as_str())
-                            .unwrap_or("Favorites")
+                            .unwrap_or("Favorites"),
                     )
                     .show_ui(ui, |ui| {
                         for i in 0..self.config.favorites.iter().len() {
                             let name = self.config.favorites[i].name.clone();
-                            if ui.selectable_label(self.config.last_favorite_index == Some(i), name).clicked() {
+                            if ui
+                                .selectable_label(self.config.last_favorite_index == Some(i), name)
+                                .clicked()
+                            {
                                 self.jump_to_favorite(i);
                             }
                         }
@@ -266,7 +359,8 @@ impl AssetViewerApp {
                 if ui.button("Add Favorite…").clicked() {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                         self.new_favorite_path = folder;
-                        self.new_favorite_name = self.new_favorite_path
+                        self.new_favorite_name = self
+                            .new_favorite_path
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
@@ -279,7 +373,11 @@ impl AssetViewerApp {
                 if ui.button("Export Selected…").clicked() {
                     if let Some(path) = self.selected_file.clone() {
                         if let Some(target_dir) = rfd::FileDialog::new().pick_folder() {
-                            let _ = crate::fs_model::export_asset(&path, &target_dir, self.config.flatten_export);
+                            let _ = crate::fs_model::export_asset(
+                                &path,
+                                &target_dir,
+                                self.config.flatten_export,
+                            );
                         }
                     }
                 }
@@ -294,7 +392,9 @@ impl AssetViewerApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("📍");
-                let response = ui.add(egui::TextEdit::singleline(&mut self.address_bar).desired_width(f32::INFINITY));
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.address_bar).desired_width(f32::INFINITY),
+                );
                 if response.lost_focus() && (ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                     let new_path = PathBuf::from(&self.address_bar);
                     if new_path.exists() {
@@ -316,18 +416,16 @@ impl AssetViewerApp {
             .default_width(280.0)
             .show(ctx, |ui| {
                 ui.heading("Quick Access");
-                
+
                 let mut jump_to = None;
                 if self.config.favorites.is_empty() {
                     ui.label(RichText::new("No favorites yet").small().italics());
                 } else {
                     for i in 0..self.config.favorites.len() {
                         let fav = &self.config.favorites[i];
-                        let is_active = self.config.last_favorite_index == Some(i) && self.root_path == PathBuf::from(&fav.path);
-                        let response = ui.selectable_label(
-                            is_active,
-                            format!("⭐ {}", fav.name)
-                        );
+                        let is_active = self.config.last_favorite_index == Some(i)
+                            && self.root_path == PathBuf::from(&fav.path);
+                        let response = ui.selectable_label(is_active, format!("⭐ {}", fav.name));
                         if response.clicked() {
                             jump_to = Some(i);
                         }
@@ -346,9 +444,13 @@ impl AssetViewerApp {
 
                 let mut next_selected = None;
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.tree.ui_render(ui, &mut |selected| {
-                        next_selected = Some(selected.to_path_buf());
-                    }, &self.selected_dir);
+                    self.tree.ui_render(
+                        ui,
+                        &mut |selected| {
+                            next_selected = Some(selected.to_path_buf());
+                        },
+                        &self.selected_dir,
+                    );
                 });
 
                 if let Some(dir) = next_selected {
@@ -362,7 +464,13 @@ impl AssetViewerApp {
             ui.horizontal(|ui| {
                 ui.heading("Files");
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Search...")).changed() {
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.search_query)
+                                .hint_text("Search..."),
+                        )
+                        .changed()
+                    {
                         self.apply_filters();
                     }
                     ui.label("🔍");
@@ -371,33 +479,67 @@ impl AssetViewerApp {
 
             ui.horizontal(|ui| {
                 ui.label("Sort:");
-                if ui.selectable_label(self.sort_mode == SortMode::Name, "Name").clicked() {
-                    if self.sort_mode == SortMode::Name { self.sort_ascending = !self.sort_ascending; }
-                    else { self.sort_mode = SortMode::Name; self.sort_ascending = true; }
+                if ui
+                    .selectable_label(self.sort_mode == SortMode::Name, "Name")
+                    .clicked()
+                {
+                    if self.sort_mode == SortMode::Name {
+                        self.sort_ascending = !self.sort_ascending;
+                    } else {
+                        self.sort_mode = SortMode::Name;
+                        self.sort_ascending = true;
+                    }
                     self.apply_filters();
                 }
-                if ui.selectable_label(self.sort_mode == SortMode::Type, "Type").clicked() {
-                    if self.sort_mode == SortMode::Type { self.sort_ascending = !self.sort_ascending; }
-                    else { self.sort_mode = SortMode::Type; self.sort_ascending = true; }
+                if ui
+                    .selectable_label(self.sort_mode == SortMode::Type, "Type")
+                    .clicked()
+                {
+                    if self.sort_mode == SortMode::Type {
+                        self.sort_ascending = !self.sort_ascending;
+                    } else {
+                        self.sort_mode = SortMode::Type;
+                        self.sort_ascending = true;
+                    }
                     self.apply_filters();
                 }
-                if ui.selectable_label(self.sort_mode == SortMode::Size, "Size").clicked() {
-                    if self.sort_mode == SortMode::Size { self.sort_ascending = !self.sort_ascending; }
-                    else { self.sort_mode = SortMode::Size; self.sort_ascending = true; }
+                if ui
+                    .selectable_label(self.sort_mode == SortMode::Size, "Size")
+                    .clicked()
+                {
+                    if self.sort_mode == SortMode::Size {
+                        self.sort_ascending = !self.sort_ascending;
+                    } else {
+                        self.sort_mode = SortMode::Size;
+                        self.sort_ascending = true;
+                    }
                     self.apply_filters();
                 }
-                if ui.selectable_label(self.sort_mode == SortMode::Date, "Date").clicked() {
-                    if self.sort_mode == SortMode::Date { self.sort_ascending = !self.sort_ascending; }
-                    else { self.sort_mode = SortMode::Date; self.sort_ascending = true; }
+                if ui
+                    .selectable_label(self.sort_mode == SortMode::Date, "Date")
+                    .clicked()
+                {
+                    if self.sort_mode == SortMode::Date {
+                        self.sort_ascending = !self.sort_ascending;
+                    } else {
+                        self.sort_mode = SortMode::Date;
+                        self.sort_ascending = true;
+                    }
                     self.apply_filters();
                 }
 
                 ui.separator();
                 ui.label("View:");
-                if ui.selectable_label(self.view_mode == ViewMode::List, "☰ List").clicked() {
+                if ui
+                    .selectable_label(self.view_mode == ViewMode::List, "☰ List")
+                    .clicked()
+                {
                     self.view_mode = ViewMode::List;
                 }
-                if ui.selectable_label(self.view_mode == ViewMode::Grid, "▦ Grid").clicked() {
+                if ui
+                    .selectable_label(self.view_mode == ViewMode::Grid, "▦ Grid")
+                    .clicked()
+                {
                     self.view_mode = ViewMode::Grid;
                 }
             });
@@ -428,8 +570,11 @@ impl AssetViewerApp {
 
                         response.context_menu(|ui| {
                             if ui.button("Open").clicked() {
-                                if entry.is_dir { clicked_dir = Some(entry.path().to_path_buf()); }
-                                else { clicked_file = Some(entry.path().to_path_buf()); }
+                                if entry.is_dir {
+                                    clicked_dir = Some(entry.path().to_path_buf());
+                                } else {
+                                    clicked_file = Some(entry.path().to_path_buf());
+                                }
                                 ui.close_menu();
                             }
                             if ui.button("Open in Explorer").clicked() {
@@ -465,32 +610,68 @@ impl AssetViewerApp {
                                 .map(|p| p == entry.path())
                                 .unwrap_or(false);
 
-                            let (rect, response) = ui.allocate_at_least(item_size, egui::Sense::click());
-                            
+                            let (rect, response) =
+                                ui.allocate_at_least(item_size, egui::Sense::click());
+
                             if ui.is_rect_visible(rect) {
-                                let visuals = ui.style().interact_selectable(&response, is_selected);
+                                let visuals =
+                                    ui.style().interact_selectable(&response, is_selected);
                                 if is_selected || response.hovered() {
-                                    ui.painter().rect(rect.expand(2.0), 4.0, visuals.bg_fill, visuals.bg_stroke);
+                                    ui.painter().rect(
+                                        rect.expand(2.0),
+                                        4.0,
+                                        visuals.bg_fill,
+                                        visuals.bg_stroke,
+                                    );
                                 }
 
                                 // Draw thumbnail or icon
-                                let thumb_rect = egui::Rect::from_min_size(rect.min + egui::vec2(10.0, 5.0), egui::vec2(80.0, 80.0));
+                                let thumb_rect = egui::Rect::from_min_size(
+                                    rect.min + egui::vec2(10.0, 5.0),
+                                    egui::vec2(80.0, 80.0),
+                                );
                                 if let Some(thumb) = self.thumbnail_cache.get(&entry.path) {
-                                    ui.painter().image(thumb.texture_id(ctx), thumb_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                                    ui.painter().image(
+                                        thumb.texture_id(ctx),
+                                        thumb_rect,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        egui::Color32::WHITE,
+                                    );
                                 } else {
                                     let icon = if entry.is_dir { "📁" } else { "📄" };
-                                    ui.painter().text(thumb_rect.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(40.0), visuals.fg_stroke.color);
+                                    ui.painter().text(
+                                        thumb_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        icon,
+                                        egui::FontId::proportional(40.0),
+                                        visuals.fg_stroke.color,
+                                    );
                                 }
 
                                 // Draw name
-                                let name_rect = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.min.y + 90.0), rect.max);
-                                ui.painter().text(name_rect.center(), egui::Align2::CENTER_CENTER, &entry.name, egui::FontId::proportional(12.0), visuals.fg_stroke.color);
+                                let name_rect = egui::Rect::from_min_max(
+                                    egui::pos2(rect.min.x, rect.min.y + 90.0),
+                                    rect.max,
+                                );
+                                ui.painter().text(
+                                    name_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    &entry.name,
+                                    egui::FontId::proportional(12.0),
+                                    visuals.fg_stroke.color,
+                                );
                             }
 
                             response.context_menu(|ui| {
                                 if ui.button("Open").clicked() {
-                                    if entry.is_dir { clicked_dir = Some(entry.path().to_path_buf()); }
-                                    else { clicked_file = Some(entry.path().to_path_buf()); }
+                                    if entry.is_dir {
+                                        clicked_dir = Some(entry.path().to_path_buf());
+                                    } else {
+                                        clicked_file = Some(entry.path().to_path_buf());
+                                    }
                                     ui.close_menu();
                                 }
                                 if ui.button("Open in Explorer").clicked() {
@@ -564,7 +745,7 @@ impl AssetViewerApp {
                     Ok(preview) => preview.ui(ui),
                     Err(err) => {
                         ui.colored_label(egui::Color32::from_rgb(255, 120, 120), format!("Preview error: {err:#}"));
-                        ui.label("Tip: images and basic audio decoding are implemented. Video/3D is stubbed for now.");
+                        ui.label("Tip: some previews depend on external tools such as ffmpeg, Blender, or PDFium.");
                     }
                 }
             });
@@ -622,19 +803,33 @@ impl AssetViewerApp {
                                 ui.horizontal(|ui| {
                                     ui.vertical(|ui| {
                                         ui.text_edit_singleline(&mut self.config.favorites[i].name);
-                                        ui.label(RichText::new(&self.config.favorites[i].path).small().color(egui::Color32::GRAY));
+                                        ui.label(
+                                            RichText::new(&self.config.favorites[i].path)
+                                                .small()
+                                                .color(egui::Color32::GRAY),
+                                        );
                                     });
-                                    
-                                    ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("🗑").on_hover_text("Remove").clicked() {
-                                            to_remove = Some(i);
-                                        }
-                                        if ui.button("📂").on_hover_text("Change Path").clicked() {
-                                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                                                self.config.favorites[i].path = folder.to_string_lossy().to_string();
+
+                                    ui.with_layout(
+                                        Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.button("🗑").on_hover_text("Remove").clicked() {
+                                                to_remove = Some(i);
                                             }
-                                        }
-                                    });
+                                            if ui
+                                                .button("📂")
+                                                .on_hover_text("Change Path")
+                                                .clicked()
+                                            {
+                                                if let Some(folder) =
+                                                    rfd::FileDialog::new().pick_folder()
+                                                {
+                                                    self.config.favorites[i].path =
+                                                        folder.to_string_lossy().to_string();
+                                                }
+                                            }
+                                        },
+                                    );
                                 });
                             });
                         }
@@ -649,7 +844,10 @@ impl AssetViewerApp {
                 if ui.button("Add New Favorite…").clicked() {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                         let path = folder.to_string_lossy().to_string();
-                        let name = folder.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "New Favorite".to_string());
+                        let name = folder
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "New Favorite".to_string());
                         self.add_favorite(name, path);
                     }
                 }
@@ -673,7 +871,10 @@ impl AssetViewerApp {
 
                 ui.separator();
                 ui.heading("Export Settings");
-                ui.checkbox(&mut self.config.flatten_export, "Flatten textures to root folder");
+                ui.checkbox(
+                    &mut self.config.flatten_export,
+                    "Flatten textures to root folder",
+                );
                 ui.horizontal(|ui| {
                     ui.label("Profile:");
                     egui::ComboBox::from_id_source("export_profile")
@@ -681,7 +882,10 @@ impl AssetViewerApp {
                         .show_ui(ui, |ui| {
                             let profiles = ["Generic", "Unreal Engine", "Unity", "Blender"];
                             for p in profiles {
-                                if ui.selectable_label(self.config.export_profile == p, p).clicked() {
+                                if ui
+                                    .selectable_label(self.config.export_profile == p, p)
+                                    .clicked()
+                                {
                                     self.config.export_profile = p.to_string();
                                     self.save_config();
                                 }
@@ -690,7 +894,9 @@ impl AssetViewerApp {
                 });
 
                 ui.separator();
-                ui.small("Phase 4 (GPU renderer) and Phase 3 (FFmpeg) are still in active development.");
+                ui.small(
+                    "Phase 4 (GPU renderer) and Phase 3 (FFmpeg) are still in active development.",
+                );
             });
 
         self.show_settings = is_open;
@@ -731,6 +937,31 @@ impl AssetViewerApp {
 
 impl eframe::App for AssetViewerApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.handle_mouse_navigation(ctx);
+        // Drain thumbnail results from background thread
+        if let Some(rx) = &self.thumbnail_rx {
+            let mut done = false;
+            loop {
+                match rx.try_recv() {
+                    Ok((path, bytes, name)) => {
+                        if let Ok(image) =
+                            egui_extras::RetainedImage::from_image_bytes(name, &bytes)
+                        {
+                            self.thumbnail_cache.insert(path, image);
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            if done {
+                self.thumbnail_rx = None;
+            }
+        }
+
         self.render_top_bar(ctx);
         self.render_left_tree(ctx);
         self.render_right_preview(ctx);
