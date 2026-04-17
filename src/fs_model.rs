@@ -3,6 +3,15 @@ use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Action requested from folder tree context menu.
+#[derive(Debug, Clone)]
+pub enum FolderAction {
+    NewFolder(PathBuf),
+    Rename(PathBuf),
+    Delete(PathBuf),
+    Properties(PathBuf),
+}
+
 #[derive(Debug, Clone)]
 pub struct FsEntry {
     pub name: String,
@@ -137,6 +146,7 @@ impl DirNode {
         ui: &mut egui::Ui,
         on_select: &mut dyn FnMut(&Path),
         selected_dir: &Path,
+        actions: &mut Vec<FolderAction>,
     ) {
         let is_selected = &self.path == selected_dir;
         let is_this_pc = self.path == PathBuf::from("this_pc");
@@ -158,13 +168,59 @@ impl DirNode {
                 self.load_children();
             }
             for child in &mut self.children {
-                child.ui_render(ui, on_select, selected_dir);
+                child.ui_render(ui, on_select, selected_dir, actions);
             }
         });
+
+        // Context menu on folder nodes (not "This PC")
+        if !is_this_pc {
+            let path = self.path.clone();
+            response.header_response.context_menu(|ui| {
+                if ui.button("📁 Nieuwe map").clicked() {
+                    actions.push(FolderAction::NewFolder(path.clone()));
+                    ui.close_menu();
+                }
+                if ui.button("✏ Hernoemen").clicked() {
+                    actions.push(FolderAction::Rename(path.clone()));
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("🗑 Verwijderen").clicked() {
+                    actions.push(FolderAction::Delete(path.clone()));
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("ℹ Eigenschappen").clicked() {
+                    actions.push(FolderAction::Properties(path.clone()));
+                    ui.close_menu();
+                }
+            });
+        }
 
         if response.header_response.clicked() {
             if !is_this_pc {
                 on_select(&self.path);
+            }
+        }
+    }
+
+    /// Reload children after a filesystem change (new folder, rename, delete).
+    pub fn reload_children(&mut self) {
+        self.has_loaded = false;
+        self.children.clear();
+        self.load_children();
+    }
+
+    /// Recursively find the node for a given path and reload its children.
+    pub fn reload_at(&mut self, target: &Path) {
+        if self.path == target {
+            self.reload_children();
+            return;
+        }
+        for child in &mut self.children {
+            if target.starts_with(&child.path) {
+                child.reload_at(target);
+                return;
             }
         }
     }

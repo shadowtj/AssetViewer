@@ -42,7 +42,7 @@ Asset Viewer is a **three-panel Windows desktop file browser** for previewing cr
 - **Model3D** — `tobj` for OBJ, `easy_gltf` for GLTF/GLB; shows mesh/material stats
 - **Blend** — headless Blender executable required; renders thumbnail via Python script (blocking)
 - **Sprite** — custom BitWise engine `.sprite` JSON format with animated playback
-- **Zip** — `zip` crate, hierarchical tree view
+- **Archives** — `zip` crate for `.zip`, `sevenz-rust2` for `.7z`, `unrar` for `.rar`; hierarchical tree view
 - **Text** — read-only `egui::TextEdit`
 
 ### Key Design Notes
@@ -52,3 +52,5 @@ Asset Viewer is a **three-panel Windows desktop file browser** for previewing cr
 - **Export logic** (`fs_model.rs::export_asset`): Copies the primary file plus sidecar discovery (`.mtl`, `_diffuse.png`, `textures/` subdirs, etc.). Optional flatten flag.
 - **Favorites**: Stored in config, auto-deduplicated with `(2)` suffix pattern.
 - **Thumbnail cache**: In-memory per session; audio peak cache is persisted to disk by file hash.
+- **Large files**: `preview.rs` (~2600 lines) contains all preview implementations in one file. `app.rs` (~970 lines) holds all UI layout.
+- **Constraints** (from `codex_prompt.md`): No internet calls or API keys. Keep changes incremental. Keep the app compiling on Windows at all times.

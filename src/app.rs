@@ -1,10 +1,61 @@
 #![allow(deprecated)]
 
 use crate::config::{AppConfig, ConfigStore};
-use crate::fs_model::{DirNode, FsEntry};
+use crate::fs_model::{DirNode, FolderAction, FsEntry};
 use crate::preview::{PreviewCache, PreviewKind, PreviewUi};
 use egui::{CentralPanel, Context, Id, Layout, RichText, SidePanel, TopBottomPanel};
 use std::path::{Path, PathBuf};
+
+#[derive(Clone)]
+pub struct FolderProperties {
+    pub total_size: u64,
+    pub file_count: usize,
+    pub folder_count: usize,
+    pub empty_folders: Vec<PathBuf>,
+}
+
+impl FolderProperties {
+    pub fn scan(path: &Path) -> Self {
+        let mut total_size = 0u64;
+        let mut file_count = 0usize;
+        let mut folder_count = 0usize;
+        let mut empty_folders = Vec::new();
+
+        for entry in walkdir::WalkDir::new(path).min_depth(1) {
+            let Ok(entry) = entry else { continue };
+            if entry.file_type().is_dir() {
+                folder_count += 1;
+                // Check if this dir has any children
+                let has_children = std::fs::read_dir(entry.path())
+                    .map(|mut rd| rd.next().is_some())
+                    .unwrap_or(false);
+                if !has_children {
+                    empty_folders.push(entry.path().to_path_buf());
+                }
+            } else {
+                file_count += 1;
+                total_size += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+
+        Self { total_size, file_count, folder_count, empty_folders }
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortMode {
@@ -52,6 +103,20 @@ pub struct AssetViewerApp {
 
     // Audio output
     _audio_stream: Option<(rodio::OutputStream, rodio::OutputStreamHandle)>,
+
+    // Folder/file management dialogs
+    folder_new_parent: Option<PathBuf>,
+    folder_new_name: String,
+    folder_rename_path: Option<PathBuf>,
+    folder_rename_name: String,
+    folder_delete_path: Option<PathBuf>,
+    // File management (center list)
+    file_rename_path: Option<PathBuf>,
+    file_rename_name: String,
+    file_delete_path: Option<PathBuf>,
+    // Properties dialog
+    properties_path: Option<PathBuf>,
+    properties_info: Option<FolderProperties>,
 
     // Stored context for background threads
     ctx: egui::Context,
@@ -103,6 +168,16 @@ impl AssetViewerApp {
             thumbnail_cache: std::collections::HashMap::new(),
             thumbnail_rx: None,
             _audio_stream: audio_stream,
+            folder_new_parent: None,
+            folder_new_name: String::new(),
+            folder_rename_path: None,
+            folder_rename_name: String::new(),
+            folder_delete_path: None,
+            file_rename_path: None,
+            file_rename_name: String::new(),
+            file_delete_path: None,
+            properties_path: None,
+            properties_info: None,
             ctx: cc.egui_ctx.clone(),
         };
         app.load_thumbnails();
@@ -443,6 +518,7 @@ impl AssetViewerApp {
                 ui.separator();
 
                 let mut next_selected = None;
+                let mut folder_actions = Vec::new();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     self.tree.ui_render(
                         ui,
@@ -450,11 +526,35 @@ impl AssetViewerApp {
                             next_selected = Some(selected.to_path_buf());
                         },
                         &self.selected_dir,
+                        &mut folder_actions,
                     );
                 });
 
                 if let Some(dir) = next_selected {
                     self.select_dir(dir);
+                }
+
+                for action in folder_actions {
+                    match action {
+                        FolderAction::NewFolder(parent) => {
+                            self.folder_new_name = "Nieuwe map".to_string();
+                            self.folder_new_parent = Some(parent);
+                        }
+                        FolderAction::Rename(path) => {
+                            let name = path.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            self.folder_rename_name = name;
+                            self.folder_rename_path = Some(path);
+                        }
+                        FolderAction::Delete(path) => {
+                            self.folder_delete_path = Some(path);
+                        }
+                        FolderAction::Properties(path) => {
+                            self.properties_info = Some(FolderProperties::scan(&path));
+                            self.properties_path = Some(path);
+                        }
+                    }
                 }
             });
     }
@@ -550,6 +650,10 @@ impl AssetViewerApp {
             let mut clicked_file = None;
             let mut open_explorer = None;
             let mut copy_path = None;
+            let mut rename_entry: Option<PathBuf> = None;
+            let mut delete_entry: Option<PathBuf> = None;
+            let mut new_folder_in: Option<PathBuf> = None;
+            let mut properties_entry: Option<PathBuf> = None;
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if self.view_mode == ViewMode::List {
@@ -584,6 +688,26 @@ impl AssetViewerApp {
                             if ui.button("Copy Path").clicked() {
                                 copy_path = Some(entry.path().to_string_lossy().to_string());
                                 ui.close_menu();
+                            }
+                            ui.separator();
+                            if entry.is_dir && ui.button("📁 Nieuwe map").clicked() {
+                                new_folder_in = Some(entry.path().to_path_buf());
+                                ui.close_menu();
+                            }
+                            if ui.button("✏ Hernoemen").clicked() {
+                                rename_entry = Some(entry.path().to_path_buf());
+                                ui.close_menu();
+                            }
+                            if ui.button("🗑 Verwijderen").clicked() {
+                                delete_entry = Some(entry.path().to_path_buf());
+                                ui.close_menu();
+                            }
+                            if entry.is_dir {
+                                ui.separator();
+                                if ui.button("ℹ Eigenschappen").clicked() {
+                                    properties_entry = Some(entry.path().to_path_buf());
+                                    ui.close_menu();
+                                }
                             }
                         });
 
@@ -682,6 +806,26 @@ impl AssetViewerApp {
                                     copy_path = Some(entry.path().to_string_lossy().to_string());
                                     ui.close_menu();
                                 }
+                                ui.separator();
+                                if entry.is_dir && ui.button("📁 Nieuwe map").clicked() {
+                                    new_folder_in = Some(entry.path().to_path_buf());
+                                    ui.close_menu();
+                                }
+                                if ui.button("✏ Hernoemen").clicked() {
+                                    rename_entry = Some(entry.path().to_path_buf());
+                                    ui.close_menu();
+                                }
+                                if ui.button("🗑 Verwijderen").clicked() {
+                                    delete_entry = Some(entry.path().to_path_buf());
+                                    ui.close_menu();
+                                }
+                                if entry.is_dir {
+                                    ui.separator();
+                                    if ui.button("ℹ Eigenschappen").clicked() {
+                                        properties_entry = Some(entry.path().to_path_buf());
+                                        ui.close_menu();
+                                    }
+                                }
                             });
 
                             if response.clicked() {
@@ -718,6 +862,34 @@ impl AssetViewerApp {
 
             if let Some(path) = copy_path {
                 ui.output_mut(|o| o.copied_text = path);
+            }
+
+            if let Some(parent) = new_folder_in {
+                self.folder_new_name = "Nieuwe map".to_string();
+                self.folder_new_parent = Some(parent);
+            }
+            if let Some(path) = rename_entry {
+                let name = path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if path.is_dir() {
+                    self.folder_rename_name = name;
+                    self.folder_rename_path = Some(path);
+                } else {
+                    self.file_rename_name = name;
+                    self.file_rename_path = Some(path);
+                }
+            }
+            if let Some(path) = delete_entry {
+                if path.is_dir() {
+                    self.folder_delete_path = Some(path);
+                } else {
+                    self.file_delete_path = Some(path);
+                }
+            }
+            if let Some(path) = properties_entry {
+                self.properties_info = Some(FolderProperties::scan(&path));
+                self.properties_path = Some(path);
             }
         });
     }
@@ -904,6 +1076,303 @@ impl AssetViewerApp {
             self.set_root_path(root);
         }
     }
+    fn render_folder_new_dialog(&mut self, ctx: &Context) {
+        let Some(parent) = self.folder_new_parent.clone() else { return };
+
+        let mut open = true;
+        egui::Window::new("Nieuwe map")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("In: {}", parent.display()));
+                ui.horizontal(|ui| {
+                    ui.label("Naam:");
+                    let re = ui.text_edit_singleline(&mut self.folder_new_name);
+                    if re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let new_path = parent.join(&self.folder_new_name);
+                        if let Ok(()) = std::fs::create_dir(&new_path) {
+                            self.tree.reload_at(&parent);
+                            if self.selected_dir == parent {
+                                self.refresh_selected_dir();
+                            }
+                        }
+                        self.folder_new_parent = None;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Aanmaken").clicked() {
+                        let new_path = parent.join(&self.folder_new_name);
+                        if let Ok(()) = std::fs::create_dir(&new_path) {
+                            self.tree.reload_at(&parent);
+                            if self.selected_dir == parent {
+                                self.refresh_selected_dir();
+                            }
+                        }
+                        self.folder_new_parent = None;
+                    }
+                    if ui.button("Annuleren").clicked() {
+                        self.folder_new_parent = None;
+                    }
+                });
+            });
+        if !open {
+            self.folder_new_parent = None;
+        }
+    }
+
+    fn render_folder_rename_dialog(&mut self, ctx: &Context) {
+        let Some(old_path) = self.folder_rename_path.clone() else { return };
+
+        let mut open = true;
+        egui::Window::new("Map hernoemen")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("Map: {}", old_path.display()));
+                ui.horizontal(|ui| {
+                    ui.label("Nieuwe naam:");
+                    let re = ui.text_edit_singleline(&mut self.folder_rename_name);
+                    if re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        self.do_folder_rename(&old_path);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Hernoemen").clicked() {
+                        self.do_folder_rename(&old_path);
+                    }
+                    if ui.button("Annuleren").clicked() {
+                        self.folder_rename_path = None;
+                    }
+                });
+            });
+        if !open {
+            self.folder_rename_path = None;
+        }
+    }
+
+    fn do_folder_rename(&mut self, old_path: &Path) {
+        if let Some(parent) = old_path.parent() {
+            let new_path = parent.join(&self.folder_rename_name);
+            if let Ok(()) = std::fs::rename(old_path, &new_path) {
+                self.tree.reload_at(parent);
+                if self.selected_dir == old_path {
+                    self.select_dir(new_path);
+                } else if self.selected_dir == parent {
+                    self.refresh_selected_dir();
+                }
+            }
+        }
+        self.folder_rename_path = None;
+    }
+
+    fn render_folder_delete_dialog(&mut self, ctx: &Context) {
+        let Some(path) = self.folder_delete_path.clone() else { return };
+
+        let mut open = true;
+        egui::Window::new("Map verwijderen")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("Weet je zeker dat je deze map wilt verwijderen?"));
+                ui.monospace(path.to_string_lossy().to_string());
+                ui.label(RichText::new("Dit verwijdert de map en alle inhoud!").color(egui::Color32::from_rgb(255, 120, 120)));
+                ui.horizontal(|ui| {
+                    if ui.button("Verwijderen").clicked() {
+                        if let Some(parent) = path.parent() {
+                            if let Ok(()) = std::fs::remove_dir_all(&path) {
+                                self.tree.reload_at(parent);
+                                if self.selected_dir == path || self.selected_dir.starts_with(&path) {
+                                    self.select_dir(parent.to_path_buf());
+                                } else if self.selected_dir == parent {
+                                    self.refresh_selected_dir();
+                                }
+                            }
+                        }
+                        self.folder_delete_path = None;
+                    }
+                    if ui.button("Annuleren").clicked() {
+                        self.folder_delete_path = None;
+                    }
+                });
+            });
+        if !open {
+            self.folder_delete_path = None;
+        }
+    }
+
+    fn render_file_rename_dialog(&mut self, ctx: &Context) {
+        let Some(old_path) = self.file_rename_path.clone() else { return };
+
+        let mut open = true;
+        egui::Window::new("Bestand hernoemen")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("Bestand: {}", old_path.display()));
+                ui.horizontal(|ui| {
+                    ui.label("Nieuwe naam:");
+                    let re = ui.text_edit_singleline(&mut self.file_rename_name);
+                    if re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if let Some(parent) = old_path.parent() {
+                            let new_path = parent.join(&self.file_rename_name);
+                            if std::fs::rename(&old_path, &new_path).is_ok() {
+                                if self.selected_file.as_ref() == Some(&old_path) {
+                                    self.selected_file = Some(new_path);
+                                }
+                                self.refresh_selected_dir();
+                            }
+                        }
+                        self.file_rename_path = None;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Hernoemen").clicked() {
+                        if let Some(parent) = old_path.parent() {
+                            let new_path = parent.join(&self.file_rename_name);
+                            if std::fs::rename(&old_path, &new_path).is_ok() {
+                                if self.selected_file.as_ref() == Some(&old_path) {
+                                    self.selected_file = Some(new_path);
+                                }
+                                self.refresh_selected_dir();
+                            }
+                        }
+                        self.file_rename_path = None;
+                    }
+                    if ui.button("Annuleren").clicked() {
+                        self.file_rename_path = None;
+                    }
+                });
+            });
+        if !open {
+            self.file_rename_path = None;
+        }
+    }
+
+    fn render_file_delete_dialog(&mut self, ctx: &Context) {
+        let Some(path) = self.file_delete_path.clone() else { return };
+
+        let mut open = true;
+        egui::Window::new("Bestand verwijderen")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Weet je zeker dat je dit wilt verwijderen?");
+                ui.monospace(path.to_string_lossy().to_string());
+                ui.horizontal(|ui| {
+                    if ui.button("Verwijderen").clicked() {
+                        let is_dir = path.is_dir();
+                        let ok = if is_dir {
+                            std::fs::remove_dir_all(&path).is_ok()
+                        } else {
+                            std::fs::remove_file(&path).is_ok()
+                        };
+                        if ok {
+                            if self.selected_file.as_ref() == Some(&path) {
+                                self.selected_file = None;
+                            }
+                            self.refresh_selected_dir();
+                            if is_dir {
+                                if let Some(parent) = path.parent() {
+                                    self.tree.reload_at(parent);
+                                }
+                            }
+                        }
+                        self.file_delete_path = None;
+                    }
+                    if ui.button("Annuleren").clicked() {
+                        self.file_delete_path = None;
+                    }
+                });
+            });
+        if !open {
+            self.file_delete_path = None;
+        }
+    }
+
+    fn render_properties_dialog(&mut self, ctx: &Context) {
+        let Some(path) = self.properties_path.clone() else { return };
+        let Some(info) = self.properties_info.clone() else { return };
+
+        let mut open = true;
+        egui::Window::new("Eigenschappen")
+            .collapsible(false)
+            .resizable(true)
+            .open(&mut open)
+            .default_width(400.0)
+            .show(ctx, |ui| {
+                let name = path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.to_string_lossy().to_string());
+                ui.heading(format!("📁 {}", name));
+                ui.monospace(path.to_string_lossy().to_string());
+                ui.separator();
+
+                egui::Grid::new("properties_grid").num_columns(2).spacing([20.0, 4.0]).show(ui, |ui| {
+                    ui.label("Totale grootte:");
+                    ui.label(format_size(info.total_size));
+                    ui.end_row();
+
+                    ui.label("Bestanden:");
+                    ui.label(format!("{}", info.file_count));
+                    ui.end_row();
+
+                    ui.label("Mappen:");
+                    ui.label(format!("{}", info.folder_count));
+                    ui.end_row();
+
+                    ui.label("Lege mappen:");
+                    ui.label(format!("{}", info.empty_folders.len()));
+                    ui.end_row();
+                });
+
+                if !info.empty_folders.is_empty() {
+                    ui.separator();
+                    ui.label(RichText::new("Lege mappen:").strong());
+                    egui::ScrollArea::vertical()
+                        .max_height(200.0)
+                        .id_source("empty_folders_scroll")
+                        .show(ui, |ui| {
+                            for folder in &info.empty_folders {
+                                let rel = folder.strip_prefix(&path).unwrap_or(folder);
+                                ui.label(format!("  📁 {}", rel.display()));
+                            }
+                        });
+
+                    if ui.button("🗑 Lege mappen verwijderen").clicked() {
+                        for folder in &info.empty_folders {
+                            let _ = std::fs::remove_dir(folder);
+                        }
+                        // Rescan
+                        self.properties_info = Some(FolderProperties::scan(&path));
+                        self.tree.reload_at(&path);
+                        if self.selected_dir == path || self.selected_dir.starts_with(&path) {
+                            self.refresh_selected_dir();
+                        }
+                    }
+                }
+
+                ui.separator();
+                if ui.button("Vernieuwen").clicked() {
+                    self.properties_info = Some(FolderProperties::scan(&path));
+                }
+            });
+
+        if !open {
+            self.properties_path = None;
+            self.properties_info = None;
+        }
+    }
+
     fn render_add_favorite_modal(&mut self, ctx: &Context) {
         if !self.show_add_favorite_modal {
             return;
@@ -968,5 +1437,11 @@ impl eframe::App for AssetViewerApp {
         self.render_center_list(ctx);
         self.render_settings_window(ctx);
         self.render_add_favorite_modal(ctx);
+        self.render_folder_new_dialog(ctx);
+        self.render_folder_rename_dialog(ctx);
+        self.render_folder_delete_dialog(ctx);
+        self.render_file_rename_dialog(ctx);
+        self.render_file_delete_dialog(ctx);
+        self.render_properties_dialog(ctx);
     }
 }
