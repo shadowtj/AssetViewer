@@ -14,6 +14,8 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+type ActionPoints = HashMap<String, Vec<[f32; 2]>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewKind {
     Image,
@@ -243,8 +245,9 @@ impl HeicPreview {
 
         match status {
             Ok(s) if s.success() && out_path.exists() => {
-                let png_bytes = std::fs::read(&out_path)
-                    .with_context(|| format!("Reading decoded HEIC preview: {}", out_path.display()))?;
+                let png_bytes = std::fs::read(&out_path).with_context(|| {
+                    format!("Reading decoded HEIC preview: {}", out_path.display())
+                })?;
                 self.image = RetainedImage::from_image_bytes(path.to_string_lossy(), &png_bytes)
                     .map_err(|err| anyhow::anyhow!(err))?;
                 let _ = std::fs::remove_file(&input_path);
@@ -295,7 +298,11 @@ impl PreviewUi for HeicPreview {
         ui.separator();
         ui.heading("Asset Info");
         ui.group(|ui| {
-            ui.label(RichText::new(self.path.to_string_lossy()).small().color(Color32::GRAY));
+            ui.label(
+                RichText::new(self.path.to_string_lossy())
+                    .small()
+                    .color(Color32::GRAY),
+            );
             ui.label("HEIC/HEIF via ffmpeg fallback");
         });
     }
@@ -328,12 +335,16 @@ pub struct AudioPreview {
 }
 
 impl AudioPreview {
+    fn cache_dir() -> Option<PathBuf> {
+        directories::ProjectDirs::from("com", "Dev_Row", "AssetViewer")
+            .map(|pd| pd.cache_dir().join("audio_peaks"))
+    }
+
     fn get_cache_path(path: &Path) -> Option<PathBuf> {
         let mut hasher = DefaultHasher::new();
         path.to_string_lossy().hash(&mut hasher);
         let hash = hasher.finish();
-        directories::ProjectDirs::from("com", "Dev_Row", "AssetViewer").map(|pd| {
-            let cache_dir = pd.cache_dir().join("audio_peaks");
+        Self::cache_dir().map(|cache_dir| {
             let _ = std::fs::create_dir_all(&cache_dir);
             cache_dir.join(format!("{:x}.json", hash))
         })
@@ -555,10 +566,8 @@ impl PreviewUi for AudioPreview {
                     if ui.button("▶ Play").clicked() {
                         self.play();
                     }
-                } else {
-                    if ui.button("⏸ Pause").clicked() {
-                        self.pause();
-                    }
+                } else if ui.button("⏸ Pause").clicked() {
+                    self.pause();
                 }
                 if ui.button("⏹ Stop").clicked() {
                     self.stop();
@@ -648,9 +657,7 @@ enum PointOrPoints {
     Multi(Vec<[f32; 2]>),
 }
 
-fn deserialize_action_points<'de, D>(
-    deserializer: D,
-) -> Result<Option<HashMap<String, Vec<[f32; 2]>>>, D::Error>
+fn deserialize_action_points<'de, D>(deserializer: D) -> Result<Option<ActionPoints>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -732,7 +739,7 @@ impl SpritePreview {
         let mut anim_names: Vec<String> = data.animations.keys().cloned().collect();
         anim_names.sort();
         let default_anim = anim_names
-            .get(0)
+            .first()
             .cloned()
             .unwrap_or_else(|| "None".to_string());
         Ok(Self {
@@ -1160,11 +1167,7 @@ impl PreviewUi for Model3DPreview {
             }
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 6.0, Color32::from_rgb(18, 20, 24));
-            painter.rect_stroke(
-                rect,
-                6.0,
-                egui::Stroke::new(1.0, Color32::from_gray(70)),
-            );
+            painter.rect_stroke(rect, 6.0, egui::Stroke::new(1.0, Color32::from_gray(70)));
             painter.text(
                 rect.left_top() + egui::vec2(10.0, 10.0),
                 egui::Align2::LEFT_TOP,
@@ -1238,8 +1241,10 @@ impl PreviewUi for Model3DPreview {
                     world[i] = v;
                     avg_z += v[2];
                     let perspective = 2.5 / (2.5 + v[2] / max_extent.max(0.001));
-                    let x = rect.center().x + v[0] * rect.width().min(rect.height()) * 0.35 * perspective;
-                    let y = rect.center().y - v[1] * rect.width().min(rect.height()) * 0.35 * perspective;
+                    let x = rect.center().x
+                        + v[0] * rect.width().min(rect.height()) * 0.35 * perspective;
+                    let y = rect.center().y
+                        - v[1] * rect.width().min(rect.height()) * 0.35 * perspective;
                     pts[i] = egui::pos2(x, y);
                 }
                 let u = [
@@ -1257,12 +1262,28 @@ impl PreviewUi for Model3DPreview {
                     u[2] * v[0] - u[0] * v[2],
                     u[0] * v[1] - u[1] * v[0],
                 ];
-                let normal_len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt().max(0.0001);
-                let normal = [normal[0] / normal_len, normal[1] / normal_len, normal[2] / normal_len];
+                let normal_len =
+                    (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2])
+                        .sqrt()
+                        .max(0.0001);
+                let normal = [
+                    normal[0] / normal_len,
+                    normal[1] / normal_len,
+                    normal[2] / normal_len,
+                ];
                 let light_dir = [0.35f32, 0.45f32, 0.82f32];
-                let light_len = (light_dir[0] * light_dir[0] + light_dir[1] * light_dir[1] + light_dir[2] * light_dir[2]).sqrt();
-                let light_dir = [light_dir[0] / light_len, light_dir[1] / light_len, light_dir[2] / light_len];
-                let intensity = (normal[0] * light_dir[0] + normal[1] * light_dir[1] + normal[2] * light_dir[2])
+                let light_len = (light_dir[0] * light_dir[0]
+                    + light_dir[1] * light_dir[1]
+                    + light_dir[2] * light_dir[2])
+                    .sqrt();
+                let light_dir = [
+                    light_dir[0] / light_len,
+                    light_dir[1] / light_len,
+                    light_dir[2] / light_len,
+                ];
+                let intensity = (normal[0] * light_dir[0]
+                    + normal[1] * light_dir[1]
+                    + normal[2] * light_dir[2])
                     .max(0.0)
                     .mul_add(0.75, 0.25);
                 projected.push((pts, avg_z / 3.0, intensity));
@@ -1357,11 +1378,15 @@ impl BlendPreview {
         }
         preview
     }
+    fn cache_dir() -> Option<PathBuf> {
+        directories::ProjectDirs::from("com", "Dev_Row", "AssetViewer")
+            .map(|pd| pd.cache_dir().join("blender_thumbs"))
+    }
+
     fn cache_path(&self) -> Option<PathBuf> {
         let mut hasher = DefaultHasher::new();
         self.path.to_string_lossy().hash(&mut hasher);
-        directories::ProjectDirs::from("com", "Dev_Row", "AssetViewer").map(|pd| {
-            let cache_dir = pd.cache_dir().join("blender_thumbs");
+        Self::cache_dir().map(|cache_dir| {
             let _ = std::fs::create_dir_all(&cache_dir);
             cache_dir.join(format!("{:x}.png", hasher.finish()))
         })
@@ -1457,11 +1482,36 @@ impl PreviewUi for BlendPreview {
 
 // --- Video Preview ---
 
+fn parse_ffmpeg_rate(rate: &str) -> Option<f64> {
+    let rate = rate.trim();
+    if let Some((num, den)) = rate.split_once('/') {
+        let num = num.parse::<f64>().ok()?;
+        let den = den.parse::<f64>().ok()?;
+        if den > 0.0 && num.is_finite() && den.is_finite() {
+            let value = num / den;
+            return (value > 0.0 && value.is_finite()).then_some(value);
+        }
+        return None;
+    }
+
+    rate.parse::<f64>()
+        .ok()
+        .filter(|value| *value > 0.0 && value.is_finite())
+}
+
 struct VideoMetadata {
     width: u32,
     height: u32,
     duration: f64,
+    fps: f64,
     first_frame_bytes: Option<Vec<u8>>,
+    status: Option<String>,
+}
+
+struct VideoFrame {
+    request_id: u64,
+    timestamp: f64,
+    image: egui::ColorImage,
 }
 
 pub struct VideoPreview {
@@ -1488,6 +1538,12 @@ pub struct VideoPreview {
     // Streaming playback channel (bounded to 30 frames for backpressure during pause)
     playback_rx: Option<std::sync::mpsc::Receiver<egui::ColorImage>>,
     playback_child: Option<std::process::Child>,
+
+    // Single-frame loading for paused seeking and frame stepping
+    frame_rx: Option<std::sync::mpsc::Receiver<anyhow::Result<VideoFrame>>>,
+    frame_request_id: u64,
+    frame_error: Option<String>,
+    video_status: Option<String>,
 }
 
 impl VideoPreview {
@@ -1516,18 +1572,43 @@ impl VideoPreview {
                     .args([
                         "-v",
                         "error",
+                        "-select_streams",
+                        "v:0",
                         "-show_entries",
-                        "format=duration:stream=width,height",
+                        "stream=width,height,r_frame_rate,avg_frame_rate:format=duration",
                         "-of",
                         "default=noprint_wrappers=1:nokey=1",
                         &path_owned.to_string_lossy(),
                     ])
-                    .output()?;
+                    .output()
+                    .with_context(|| {
+                        "Running ffprobe. Install ffprobe/ffmpeg and make sure they are in PATH."
+                    })?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    anyhow::bail!(
+                        "ffprobe failed for {}{}",
+                        path_owned.display(),
+                        if stderr.trim().is_empty() {
+                            "".to_string()
+                        } else {
+                            format!(": {}", stderr.trim())
+                        }
+                    );
+                }
+
                 let out_str = String::from_utf8_lossy(&output.stdout);
                 let mut lines = out_str.lines();
                 let width: u32 = lines.next().unwrap_or("0").parse().unwrap_or(0);
                 let height: u32 = lines.next().unwrap_or("0").parse().unwrap_or(0);
+                let r_frame_rate = lines.next().unwrap_or("0/0");
+                let avg_frame_rate = lines.next().unwrap_or("0/0");
                 let duration: f64 = lines.next().unwrap_or("0").parse().unwrap_or(0.0);
+                let fps = parse_ffmpeg_rate(avg_frame_rate)
+                    .or_else(|| parse_ffmpeg_rate(r_frame_rate))
+                    .unwrap_or(30.0);
+
                 // Extract first frame as JPEG thumbnail
                 let frame_out = std::process::Command::new("ffmpeg")
                     .args([
@@ -1543,17 +1624,36 @@ impl VideoPreview {
                         "mjpeg",
                         "pipe:1",
                     ])
-                    .stderr(std::process::Stdio::null())
-                    .output()
-                    .ok();
-                let first_frame_bytes = frame_out
-                    .filter(|o| o.status.success() && !o.stdout.is_empty())
-                    .map(|o| o.stdout);
+                    .stderr(std::process::Stdio::piped())
+                    .output();
+                let (first_frame_bytes, status) = match frame_out {
+                    Ok(output) if output.status.success() && !output.stdout.is_empty() => {
+                        (Some(output.stdout), None)
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let detail = if stderr.trim().is_empty() {
+                            "ffmpeg could not extract the first frame.".to_string()
+                        } else {
+                            format!("ffmpeg could not extract the first frame: {}", stderr.trim())
+                        };
+                        (None, Some(detail))
+                    }
+                    Err(err) => (
+                        None,
+                        Some(format!(
+                            "Running ffmpeg failed. Install ffmpeg and make sure it is in PATH: {err}"
+                        )),
+                    ),
+                };
+
                 Ok(VideoMetadata {
                     width,
                     height,
                     duration,
+                    fps,
                     first_frame_bytes,
+                    status,
                 })
             })();
             let _ = tx.send(result);
@@ -1576,7 +1676,109 @@ impl VideoPreview {
             loading_rx: Some(rx),
             playback_rx: None,
             playback_child: None,
+            frame_rx: None,
+            frame_request_id: 0,
+            frame_error: None,
+            video_status: None,
         })
+    }
+
+    fn frame_interval(&self) -> f64 {
+        1.0 / self.playback_fps.max(1.0)
+    }
+
+    fn clamp_time(&self, timestamp: f64) -> f64 {
+        timestamp.clamp(0.0, self.duration.max(0.0))
+    }
+
+    fn set_texture(&mut self, ctx: &EguiContext, name: &str, image: egui::ColorImage) {
+        if let Some(handle) = &mut self.texture_handle {
+            handle.set(image, egui::TextureOptions::default());
+        } else {
+            self.texture_handle =
+                Some(ctx.load_texture(name, image, egui::TextureOptions::default()));
+        }
+    }
+
+    fn seek_to(&mut self, timestamp: f64, should_play: bool, ctx: &EguiContext) {
+        let timestamp = self.clamp_time(timestamp);
+        self.current_time = timestamp;
+        self.stop_streaming();
+        self.is_playing = should_play;
+        if should_play {
+            self.start_streaming(timestamp, ctx);
+        } else {
+            self.request_frame(timestamp, ctx);
+        }
+    }
+
+    fn step_frame(&mut self, direction: f64, ctx: &EguiContext) {
+        let timestamp = self.current_time + (self.frame_interval() * direction);
+        self.seek_to(timestamp, false, ctx);
+    }
+
+    fn request_frame(&mut self, timestamp: f64, ctx: &EguiContext) {
+        if self.scaled_width == 0 || self.scaled_height == 0 {
+            return;
+        }
+
+        self.frame_request_id = self.frame_request_id.wrapping_add(1);
+        self.frame_error = None;
+
+        let request_id = self.frame_request_id;
+        let timestamp = self.clamp_time(timestamp);
+        let path = self.path.clone();
+        let sw = self.scaled_width;
+        let sh = self.scaled_height;
+        let frame_bytes = (sw * sh * 4) as usize;
+        let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<VideoFrame>>();
+        self.frame_rx = Some(rx);
+        let ctx_clone = ctx.clone();
+
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<VideoFrame> {
+                let output = std::process::Command::new("ffmpeg")
+                    .args([
+                        "-ss",
+                        &format!("{:.3}", timestamp),
+                        "-i",
+                        &path.to_string_lossy(),
+                        "-frames:v",
+                        "1",
+                        "-f",
+                        "rawvideo",
+                        "-pix_fmt",
+                        "rgba",
+                        "-vf",
+                        &format!("scale={}:{}", sw, sh),
+                        "pipe:1",
+                    ])
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .with_context(|| {
+                        format!(
+                            "Extracting video frame. Install ffmpeg and make sure it is in PATH: {}",
+                            path.display()
+                        )
+                    })?;
+
+                if !output.status.success() || output.stdout.len() < frame_bytes {
+                    anyhow::bail!("Unable to extract frame at {:.2}s", timestamp);
+                }
+
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [sw as usize, sh as usize],
+                    &output.stdout[..frame_bytes],
+                );
+                Ok(VideoFrame {
+                    request_id,
+                    timestamp,
+                    image,
+                })
+            })();
+            let _ = tx.send(result);
+            ctx_clone.request_repaint();
+        });
     }
 
     /// Starts a streaming ffmpeg process from `timestamp`.
@@ -1616,12 +1818,22 @@ impl VideoPreview {
             .spawn()
         {
             Ok(c) => c,
-            Err(_) => return,
+            Err(err) => {
+                self.video_status = Some(format!(
+                    "Unable to start ffmpeg playback. Install ffmpeg and make sure it is in PATH: {err}"
+                ));
+                self.is_playing = false;
+                return;
+            }
         };
 
         let stdout = match child.stdout.take() {
             Some(s) => s,
-            None => return,
+            None => {
+                self.video_status = Some("Unable to read ffmpeg playback output.".to_string());
+                self.is_playing = false;
+                return;
+            }
         };
         self.playback_child = Some(child);
 
@@ -1672,6 +1884,8 @@ impl PreviewUi for VideoPreview {
                     self.width = meta.width;
                     self.height = meta.height;
                     self.duration = meta.duration;
+                    self.playback_fps = meta.fps;
+                    self.video_status = meta.status;
                     let (sw, sh) = Self::scaled_dims(meta.width, meta.height);
                     self.scaled_width = sw;
                     self.scaled_height = sh;
@@ -1693,9 +1907,40 @@ impl PreviewUi for VideoPreview {
                         }
                     }
                     self.loading_rx = None;
+                    if self.texture_handle.is_none() {
+                        self.request_frame(0.0, ui.ctx());
+                    }
                 }
-                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Ok(Err(err)) => {
+                    self.video_status = Some(err.to_string());
                     self.loading_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.video_status = Some("Video metadata loading stopped.".to_string());
+                    self.loading_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        // ── Poll single-frame seek requests ───────────────────────────────
+        if let Some(rx) = &self.frame_rx {
+            match rx.try_recv() {
+                Ok(Ok(frame)) => {
+                    if frame.request_id == self.frame_request_id {
+                        self.current_time = frame.timestamp;
+                        self.set_texture(ui.ctx(), "video_seek_frame", frame.image);
+                        self.frame_error = None;
+                    }
+                    self.frame_rx = None;
+                }
+                Ok(Err(err)) => {
+                    self.frame_error = Some(err.to_string());
+                    self.frame_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.frame_error = Some("Frame extraction stopped".to_string());
+                    self.frame_rx = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
@@ -1705,7 +1950,7 @@ impl PreviewUi for VideoPreview {
         let mut stream_ended = false;
         let maybe_frame = if self.is_playing {
             if let Some(rx) = &self.playback_rx {
-                let frame_interval = 1.0 / self.playback_fps;
+                let frame_interval = self.frame_interval();
                 if self.last_frame_display.elapsed().as_secs_f64() >= frame_interval {
                     match rx.try_recv() {
                         Ok(img) => Some(img),
@@ -1731,18 +1976,10 @@ impl PreviewUi for VideoPreview {
         }
 
         if let Some(image) = maybe_frame {
-            let frame_interval = 1.0 / self.playback_fps;
+            let frame_interval = self.frame_interval();
             self.current_time = (self.current_time + frame_interval).min(self.duration);
             self.last_frame_display = Instant::now();
-            if let Some(handle) = &mut self.texture_handle {
-                handle.set(image, egui::TextureOptions::default());
-            } else {
-                self.texture_handle = Some(ui.ctx().load_texture(
-                    "video_frame",
-                    image,
-                    egui::TextureOptions::default(),
-                ));
-            }
+            self.set_texture(ui.ctx(), "video_frame", image);
             if self.current_time >= self.duration {
                 self.stop_streaming();
                 self.is_playing = false;
@@ -1779,13 +2016,21 @@ impl PreviewUi for VideoPreview {
                     if self.is_playing && self.playback_rx.is_none() {
                         let t = self.current_time;
                         self.start_streaming(t, ui.ctx());
+                    } else if !self.is_playing {
+                        self.stop_streaming();
                     }
                 }
 
                 if ui.button("⏹ Stop").clicked() {
-                    self.is_playing = false;
-                    self.current_time = 0.0;
-                    self.stop_streaming();
+                    self.seek_to(0.0, false, ui.ctx());
+                }
+
+                if ui.button("⏪ Frame").clicked() {
+                    self.step_frame(-1.0, ui.ctx());
+                }
+
+                if ui.button("Frame ⏩").clicked() {
+                    self.step_frame(1.0, ui.ctx());
                 }
 
                 let mut seek = self.current_time;
@@ -1793,14 +2038,27 @@ impl PreviewUi for VideoPreview {
                     .add(Slider::new(&mut seek, 0.0..=self.duration.max(0.01)).show_value(false))
                     .changed()
                 {
-                    self.current_time = seek;
-                    self.start_streaming(seek, ui.ctx());
-                    self.is_playing = was_playing;
+                    self.seek_to(seek, was_playing, ui.ctx());
                 }
 
                 ui.label(format!("{:.1}s / {:.1}s", self.current_time, self.duration));
             });
         });
+
+        if self.frame_rx.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading frame…");
+            });
+        }
+
+        if let Some(error) = &self.frame_error {
+            ui.colored_label(Color32::RED, error);
+        }
+
+        if let Some(status) = &self.video_status {
+            ui.colored_label(Color32::LIGHT_RED, status);
+        }
 
         ui.add_space(8.0);
 
@@ -1829,6 +2087,7 @@ impl PreviewUi for VideoPreview {
         ui.heading("Asset Info");
         ui.group(|ui| {
             ui.label(format!("Resolution: {}x{}", self.width, self.height));
+            ui.label(format!("FPS: {:.2}", self.playback_fps));
             ui.label(format!(
                 "Size: {:.2} MB",
                 self.file_size as f64 / 1_048_576.0
@@ -1897,7 +2156,7 @@ impl PdfPreview {
             let explicit_path = PathBuf::from(explicit);
             if explicit_path.is_file() {
                 if let Some(dir) = explicit_path.parent() {
-                    let _ = pdfium::set_library_location(dir.to_string_lossy().as_ref());
+                    pdfium::set_library_location(dir.to_string_lossy().as_ref());
                 }
                 return Ok(explicit_path);
             }
@@ -1908,7 +2167,7 @@ impl PdfPreview {
                     "libpdfium.so"
                 });
                 if dll.exists() {
-                    let _ = pdfium::set_library_location(explicit_path.to_string_lossy().as_ref());
+                    pdfium::set_library_location(explicit_path.to_string_lossy().as_ref());
                     return Ok(dll);
                 }
             }
@@ -1927,7 +2186,7 @@ impl PdfPreview {
         };
         let direct_path = lib_dir.join(bundled_name);
         if direct_path.exists() {
-            let _ = pdfium::set_library_location(lib_dir.to_string_lossy().as_ref());
+            pdfium::set_library_location(lib_dir.to_string_lossy().as_ref());
             return Ok(direct_path);
         }
 
@@ -1983,7 +2242,7 @@ impl PdfPreview {
                 .with_context(|| format!("Copying PDFium library to {}", direct_path.display()))?;
         }
 
-        let _ = pdfium::set_library_location(lib_dir.to_string_lossy().as_ref());
+        pdfium::set_library_location(lib_dir.to_string_lossy().as_ref());
         Ok(direct_path)
     }
 
@@ -2298,7 +2557,11 @@ impl SevenZipPreview {
             }
         }
 
-        Ok(Self { root, file_count, total_size })
+        Ok(Self {
+            root,
+            file_count,
+            total_size,
+        })
     }
 }
 
@@ -2369,7 +2632,11 @@ impl RarPreview {
             }
         }
 
-        Ok(Self { root, file_count, total_size })
+        Ok(Self {
+            root,
+            file_count,
+            total_size,
+        })
     }
 }
 
@@ -2405,13 +2672,24 @@ pub struct FontPreview {
 
 impl FontPreview {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let bytes = std::fs::read(path).with_context(|| format!("Reading font: {}", path.display()))?;
+        let bytes =
+            std::fs::read(path).with_context(|| format!("Reading font: {}", path.display()))?;
         let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
             .map_err(|err| anyhow::anyhow!("Failed to parse font: {err}"))?;
         let font_name = font
             .horizontal_line_metrics(32.0)
-            .map(|_| path.file_stem().and_then(|s| s.to_str()).unwrap_or("Font").to_string())
-            .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("Font").to_string());
+            .map(|_| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Font")
+                    .to_string()
+            })
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Font")
+                    .to_string()
+            });
 
         let mut preview = Self {
             path: path.to_path_buf(),
@@ -2439,12 +2717,15 @@ impl FontPreview {
         let mut max_x = 0i32;
         let mut max_y = 0i32;
 
-        let line_metrics = self.font.horizontal_line_metrics(size).unwrap_or(fontdue::LineMetrics {
-            ascent: size * 0.8,
-            descent: -size * 0.2,
-            line_gap: 0.0,
-            new_line_size: size,
-        });
+        let line_metrics =
+            self.font
+                .horizontal_line_metrics(size)
+                .unwrap_or(fontdue::LineMetrics {
+                    ascent: size * 0.8,
+                    descent: -size * 0.2,
+                    line_gap: 0.0,
+                    new_line_size: size,
+                });
         let line_height = (line_metrics.ascent - line_metrics.descent + line_gap as f32) as i32;
 
         for ch in text.chars() {
@@ -2464,7 +2745,9 @@ impl FontPreview {
         }
 
         let width = (max_x + padding as i32).max(320) as usize;
-        let height = (max_y + padding as i32).max((baseline_y + line_height + padding as i32).max(220)) as usize;
+        let height = (max_y + padding as i32)
+            .max((baseline_y + line_height + padding as i32).max(220))
+            as usize;
         let mut pixels = vec![Color32::from_rgb(24, 24, 28); width * height];
 
         for (x, y, gw, gh, bitmap) in glyphs {
@@ -2490,7 +2773,10 @@ impl FontPreview {
             }
         }
 
-        let image = egui::ColorImage { size: [width, height], pixels };
+        let image = egui::ColorImage {
+            size: [width, height],
+            pixels,
+        };
         self.preview = Some(RetainedImage::from_color_image("font_preview", image));
     }
 }
@@ -2499,16 +2785,24 @@ impl PreviewUi for FontPreview {
     fn ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Font");
         ui.label(RichText::new(self.font_name.clone()).strong());
-        ui.label(RichText::new(self.path.to_string_lossy()).small().color(Color32::GRAY));
+        ui.label(
+            RichText::new(self.path.to_string_lossy())
+                .small()
+                .color(Color32::GRAY),
+        );
 
         ui.group(|ui| {
             ui.horizontal(|ui| {
                 ui.label("Sample:");
                 let changed = ui.text_edit_singleline(&mut self.sample_text).changed();
                 ui.label("Size:");
-                let size_changed = ui.add(Slider::new(&mut self.font_size, 8.0..=128.0)).changed();
+                let size_changed = ui
+                    .add(Slider::new(&mut self.font_size, 8.0..=128.0))
+                    .changed();
                 ui.label("Zoom:");
-                let zoom_changed = ui.add(Slider::new(&mut self.zoom, 0.25..=8.0).logarithmic(true)).changed();
+                let zoom_changed = ui
+                    .add(Slider::new(&mut self.zoom, 0.25..=8.0).logarithmic(true))
+                    .changed();
                 if ui.button("Refresh").clicked() || changed || size_changed {
                     self.refresh_preview();
                 }
@@ -2596,11 +2890,30 @@ impl PreviewUi for StubPreview {
 
 // --- Preview Cache ---
 
+pub fn clear_disk_preview_caches() -> anyhow::Result<()> {
+    for dir in [AudioPreview::cache_dir(), BlendPreview::cache_dir()]
+        .into_iter()
+        .flatten()
+    {
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("Removing cache directory: {}", dir.display()))?;
+        }
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("Recreating cache directory: {}", dir.display()))?;
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub struct PreviewCache {
     items: HashMap<PathBuf, (Instant, Preview)>,
 }
 impl PreviewCache {
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
     pub fn get_or_build(
         &mut self,
         ctx: &EguiContext,
@@ -2633,5 +2946,47 @@ impl PreviewCache {
             *t = Instant::now();
         }
         Ok(&mut self.items.get_mut(&key).unwrap().1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_ffmpeg_rate, PreviewKind};
+    use std::path::Path;
+
+    #[test]
+    fn preview_kind_detects_supported_extensions() {
+        let cases = [
+            ("image.PNG", PreviewKind::Image),
+            ("photo.heic", PreviewKind::Heic),
+            ("sound.flac", PreviewKind::Audio),
+            ("clip.webm", PreviewKind::Video),
+            ("mesh.glb", PreviewKind::Model3D),
+            ("scene.blend", PreviewKind::Blend),
+            ("anim.sprite", PreviewKind::Sprite),
+            ("doc.pdf", PreviewKind::Pdf),
+            ("archive.7z", PreviewKind::SevenZip),
+            ("packed.rar", PreviewKind::Rar),
+            ("font.otf", PreviewKind::Font),
+            ("bundle.zip", PreviewKind::Zip),
+            ("readme.md", PreviewKind::Text),
+            ("unknown.asset", PreviewKind::Unknown),
+        ];
+
+        for (name, expected) in cases {
+            assert_eq!(PreviewKind::from_path(Path::new(name)), expected);
+        }
+    }
+
+    #[test]
+    fn ffmpeg_rate_parser_handles_ratios_and_bad_values() {
+        assert_eq!(parse_ffmpeg_rate("30/1"), Some(30.0));
+        assert_eq!(
+            parse_ffmpeg_rate("30000/1001").map(|v| (v * 100.0).round() / 100.0),
+            Some(29.97)
+        );
+        assert_eq!(parse_ffmpeg_rate("24"), Some(24.0));
+        assert_eq!(parse_ffmpeg_rate("0/0"), None);
+        assert_eq!(parse_ffmpeg_rate("bad"), None);
     }
 }

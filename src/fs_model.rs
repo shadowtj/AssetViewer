@@ -148,7 +148,7 @@ impl DirNode {
         selected_dir: &Path,
         actions: &mut Vec<FolderAction>,
     ) {
-        let is_selected = &self.path == selected_dir;
+        let is_selected = self.path == selected_dir;
         let is_this_pc = self.path == PathBuf::from("this_pc");
 
         let label = if is_this_pc {
@@ -197,10 +197,8 @@ impl DirNode {
             });
         }
 
-        if response.header_response.clicked() {
-            if !is_this_pc {
-                on_select(&self.path);
-            }
+        if response.header_response.clicked() && !is_this_pc {
+            on_select(&self.path);
         }
     }
 
@@ -223,6 +221,83 @@ impl DirNode {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::export_asset;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("assetviewer_{name}_{nonce}"));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn export_asset_copies_primary_sidecars_and_nested_textures() {
+        let source = TempDir::new("export_source_nested");
+        let target = TempDir::new("export_target_nested");
+        let asset = source.path.join("ship.obj");
+        fs::write(&asset, "obj").unwrap();
+        fs::write(source.path.join("ship.mtl"), "mtl").unwrap();
+        fs::write(source.path.join("ship_diffuse.png"), "png").unwrap();
+        fs::create_dir(source.path.join("textures")).unwrap();
+        fs::write(
+            source.path.join("textures").join("ship_normal.png"),
+            "normal",
+        )
+        .unwrap();
+
+        export_asset(&asset, &target.path, false).unwrap();
+
+        assert!(target.path.join("ship.obj").exists());
+        assert!(target.path.join("ship.mtl").exists());
+        assert!(target.path.join("ship_diffuse.png").exists());
+        assert!(target
+            .path
+            .join("textures")
+            .join("ship_normal.png")
+            .exists());
+    }
+
+    #[test]
+    fn export_asset_flattens_nested_textures_when_requested() {
+        let source = TempDir::new("export_source_flat");
+        let target = TempDir::new("export_target_flat");
+        let asset = source.path.join("crate.gltf");
+        fs::write(&asset, "gltf").unwrap();
+        fs::create_dir(source.path.join("textures")).unwrap();
+        fs::write(source.path.join("textures").join("crate_color.jpg"), "jpg").unwrap();
+
+        export_asset(&asset, &target.path, true).unwrap();
+
+        assert!(target.path.join("crate.gltf").exists());
+        assert!(target.path.join("crate_color.jpg").exists());
+        assert!(!target
+            .path
+            .join("textures")
+            .join("crate_color.jpg")
+            .exists());
     }
 }
 

@@ -38,7 +38,12 @@ impl FolderProperties {
             }
         }
 
-        Self { total_size, file_count, folder_count, empty_folders }
+        Self {
+            total_size,
+            file_count,
+            folder_count,
+            empty_folders,
+        }
     }
 }
 
@@ -100,6 +105,7 @@ pub struct AssetViewerApp {
     view_mode: ViewMode,
     thumbnail_cache: std::collections::HashMap<PathBuf, egui_extras::RetainedImage>,
     thumbnail_rx: Option<std::sync::mpsc::Receiver<(PathBuf, Vec<u8>, String)>>,
+    cache_status: Option<String>,
 
     // Audio output
     _audio_stream: Option<(rodio::OutputStream, rodio::OutputStreamHandle)>,
@@ -167,6 +173,7 @@ impl AssetViewerApp {
             view_mode: ViewMode::List,
             thumbnail_cache: std::collections::HashMap::new(),
             thumbnail_rx: None,
+            cache_status: None,
             _audio_stream: audio_stream,
             folder_new_parent: None,
             folder_new_name: String::new(),
@@ -212,7 +219,11 @@ impl AssetViewerApp {
         let _ = self.config_store.save(&self.config);
     }
 
-    fn add_favorite(&mut self, name: String, path: String) {
+    fn unique_favorite_name(
+        existing: &[crate::config::FavoriteFolder],
+        name: &str,
+        path: &str,
+    ) -> String {
         let mut name = name.trim().to_string();
         if name.is_empty() {
             name = Path::new(&path)
@@ -223,11 +234,15 @@ impl AssetViewerApp {
 
         let mut final_name = name.clone();
         let mut count = 2;
-        while self.config.favorites.iter().any(|f| f.name == final_name) {
+        while existing.iter().any(|f| f.name == final_name) {
             final_name = format!("{} ({})", name, count);
             count += 1;
         }
+        final_name
+    }
 
+    fn add_favorite(&mut self, name: String, path: String) {
+        let final_name = Self::unique_favorite_name(&self.config.favorites, &name, &path);
         self.config.favorites.push(crate::config::FavoriteFolder {
             name: final_name,
             path,
@@ -541,7 +556,8 @@ impl AssetViewerApp {
                             self.folder_new_parent = Some(parent);
                         }
                         FolderAction::Rename(path) => {
-                            let name = path.file_name()
+                            let name = path
+                                .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_default();
                             self.folder_rename_name = name;
@@ -869,7 +885,8 @@ impl AssetViewerApp {
                 self.folder_new_parent = Some(parent);
             }
             if let Some(path) = rename_entry {
-                let name = path.file_name()
+                let name = path
+                    .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
                 if path.is_dir() {
@@ -1025,6 +1042,22 @@ impl AssetViewerApp {
                 }
 
                 ui.separator();
+                ui.heading("Cache");
+                ui.horizontal(|ui| {
+                    if ui.button("Clear Preview Cache").clicked() {
+                        self.preview_cache.clear();
+                        self.thumbnail_cache.clear();
+                        self.cache_status = match crate::preview::clear_disk_preview_caches() {
+                            Ok(()) => Some("Cache cleared".to_string()),
+                            Err(err) => Some(format!("Cache clear failed: {err:#}")),
+                        };
+                    }
+                    if let Some(status) = &self.cache_status {
+                        ui.label(status);
+                    }
+                });
+
+                ui.separator();
                 ui.heading("Blender Integration");
                 ui.horizontal(|ui| {
                     ui.label("Blender Exe:");
@@ -1077,7 +1110,9 @@ impl AssetViewerApp {
         }
     }
     fn render_folder_new_dialog(&mut self, ctx: &Context) {
-        let Some(parent) = self.folder_new_parent.clone() else { return };
+        let Some(parent) = self.folder_new_parent.clone() else {
+            return;
+        };
 
         let mut open = true;
         egui::Window::new("Nieuwe map")
@@ -1123,7 +1158,9 @@ impl AssetViewerApp {
     }
 
     fn render_folder_rename_dialog(&mut self, ctx: &Context) {
-        let Some(old_path) = self.folder_rename_path.clone() else { return };
+        let Some(old_path) = self.folder_rename_path.clone() else {
+            return;
+        };
 
         let mut open = true;
         egui::Window::new("Map hernoemen")
@@ -1170,7 +1207,9 @@ impl AssetViewerApp {
     }
 
     fn render_folder_delete_dialog(&mut self, ctx: &Context) {
-        let Some(path) = self.folder_delete_path.clone() else { return };
+        let Some(path) = self.folder_delete_path.clone() else {
+            return;
+        };
 
         let mut open = true;
         egui::Window::new("Map verwijderen")
@@ -1179,15 +1218,19 @@ impl AssetViewerApp {
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(format!("Weet je zeker dat je deze map wilt verwijderen?"));
+                ui.label("Weet je zeker dat je deze map wilt verwijderen?");
                 ui.monospace(path.to_string_lossy().to_string());
-                ui.label(RichText::new("Dit verwijdert de map en alle inhoud!").color(egui::Color32::from_rgb(255, 120, 120)));
+                ui.label(
+                    RichText::new("Dit verwijdert de map en alle inhoud!")
+                        .color(egui::Color32::from_rgb(255, 120, 120)),
+                );
                 ui.horizontal(|ui| {
                     if ui.button("Verwijderen").clicked() {
                         if let Some(parent) = path.parent() {
                             if let Ok(()) = std::fs::remove_dir_all(&path) {
                                 self.tree.reload_at(parent);
-                                if self.selected_dir == path || self.selected_dir.starts_with(&path) {
+                                if self.selected_dir == path || self.selected_dir.starts_with(&path)
+                                {
                                     self.select_dir(parent.to_path_buf());
                                 } else if self.selected_dir == parent {
                                     self.refresh_selected_dir();
@@ -1207,7 +1250,9 @@ impl AssetViewerApp {
     }
 
     fn render_file_rename_dialog(&mut self, ctx: &Context) {
-        let Some(old_path) = self.file_rename_path.clone() else { return };
+        let Some(old_path) = self.file_rename_path.clone() else {
+            return;
+        };
 
         let mut open = true;
         egui::Window::new("Bestand hernoemen")
@@ -1257,7 +1302,9 @@ impl AssetViewerApp {
     }
 
     fn render_file_delete_dialog(&mut self, ctx: &Context) {
-        let Some(path) = self.file_delete_path.clone() else { return };
+        let Some(path) = self.file_delete_path.clone() else {
+            return;
+        };
 
         let mut open = true;
         egui::Window::new("Bestand verwijderen")
@@ -1300,8 +1347,12 @@ impl AssetViewerApp {
     }
 
     fn render_properties_dialog(&mut self, ctx: &Context) {
-        let Some(path) = self.properties_path.clone() else { return };
-        let Some(info) = self.properties_info.clone() else { return };
+        let Some(path) = self.properties_path.clone() else {
+            return;
+        };
+        let Some(info) = self.properties_info.clone() else {
+            return;
+        };
 
         let mut open = true;
         egui::Window::new("Eigenschappen")
@@ -1310,30 +1361,34 @@ impl AssetViewerApp {
             .open(&mut open)
             .default_width(400.0)
             .show(ctx, |ui| {
-                let name = path.file_name()
+                let name = path
+                    .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.to_string_lossy().to_string());
                 ui.heading(format!("📁 {}", name));
                 ui.monospace(path.to_string_lossy().to_string());
                 ui.separator();
 
-                egui::Grid::new("properties_grid").num_columns(2).spacing([20.0, 4.0]).show(ui, |ui| {
-                    ui.label("Totale grootte:");
-                    ui.label(format_size(info.total_size));
-                    ui.end_row();
+                egui::Grid::new("properties_grid")
+                    .num_columns(2)
+                    .spacing([20.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Totale grootte:");
+                        ui.label(format_size(info.total_size));
+                        ui.end_row();
 
-                    ui.label("Bestanden:");
-                    ui.label(format!("{}", info.file_count));
-                    ui.end_row();
+                        ui.label("Bestanden:");
+                        ui.label(format!("{}", info.file_count));
+                        ui.end_row();
 
-                    ui.label("Mappen:");
-                    ui.label(format!("{}", info.folder_count));
-                    ui.end_row();
+                        ui.label("Mappen:");
+                        ui.label(format!("{}", info.folder_count));
+                        ui.end_row();
 
-                    ui.label("Lege mappen:");
-                    ui.label(format!("{}", info.empty_folders.len()));
-                    ui.end_row();
-                });
+                        ui.label("Lege mappen:");
+                        ui.label(format!("{}", info.empty_folders.len()));
+                        ui.end_row();
+                    });
 
                 if !info.empty_folders.is_empty() {
                     ui.separator();
@@ -1401,6 +1456,40 @@ impl AssetViewerApp {
                     }
                 });
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AssetViewerApp;
+    use crate::config::FavoriteFolder;
+
+    #[test]
+    fn favorite_names_are_deduplicated_with_suffixes() {
+        let existing = vec![
+            FavoriteFolder {
+                name: "Assets".to_string(),
+                path: "P:\\Assets".to_string(),
+            },
+            FavoriteFolder {
+                name: "Assets (2)".to_string(),
+                path: "D:\\Assets".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            AssetViewerApp::unique_favorite_name(&existing, "Assets", "E:\\Assets"),
+            "Assets (3)"
+        );
+    }
+
+    #[test]
+    fn empty_favorite_name_falls_back_to_folder_name() {
+        let existing = Vec::new();
+        assert_eq!(
+            AssetViewerApp::unique_favorite_name(&existing, "  ", "P:\\projects\\Rust"),
+            "Rust"
+        );
     }
 }
 

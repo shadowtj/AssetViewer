@@ -30,8 +30,8 @@ Rust desktop Asset Viewer that feels like Windows Explorer:
 
 ## Phase 3 - Video preview
 - [x] Decode first frame as thumbnail (Implemented basic placeholder for common formats)
-- [ ] Simple playback (optional, keep as later)
-- [ ] Timeline + frame stepping
+- [x] Simple playback (optional, keep as later)
+- [x] Timeline + frame stepping
 
 ## Phase 4 - 3D preview
 - [x] 3D viewer panel (orbit/drone camera) (Implemented metadata/info view first)
