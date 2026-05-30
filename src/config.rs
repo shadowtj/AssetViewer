@@ -23,6 +23,16 @@ pub struct AppConfig {
     pub flatten_export: bool,
     #[serde(default)]
     pub export_profile: String,
+    #[serde(default)]
+    pub view_mode: String,
+    #[serde(default)]
+    pub sort_mode: String,
+    #[serde(default = "default_sort_ascending")]
+    pub sort_ascending: bool,
+}
+
+fn default_sort_ascending() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]

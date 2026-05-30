@@ -76,6 +76,71 @@ pub enum ViewMode {
     Grid,
 }
 
+// Collects UI actions from the center file list to avoid borrow issues in immediate-mode loops.
+#[derive(Default)]
+struct CenterListActions {
+    clicked_dir: Option<PathBuf>,
+    clicked_file: Option<PathBuf>,
+    open_explorer: Option<PathBuf>,
+    copy_path: Option<String>,
+    rename_entry: Option<PathBuf>,
+    delete_entry: Option<PathBuf>,
+    new_folder_in: Option<PathBuf>,
+    properties_entry: Option<PathBuf>,
+}
+
+fn populate_entry_context_menu(ui: &mut egui::Ui, entry: &crate::fs_model::FsEntry, actions: &mut CenterListActions) {
+    if ui.button("Open").clicked() {
+        if entry.is_dir {
+            actions.clicked_dir = Some(entry.path().to_path_buf());
+        } else {
+            actions.clicked_file = Some(entry.path().to_path_buf());
+        }
+        ui.close_menu();
+    }
+    if ui.button("Open in Explorer").clicked() {
+        actions.open_explorer = Some(entry.path().to_path_buf());
+        ui.close_menu();
+    }
+    if ui.button("Copy Path").clicked() {
+        actions.copy_path = Some(entry.path().to_string_lossy().to_string());
+        ui.close_menu();
+    }
+    ui.separator();
+    if entry.is_dir && ui.button("📁 Nieuwe map").clicked() {
+        actions.new_folder_in = Some(entry.path().to_path_buf());
+        ui.close_menu();
+    }
+    if ui.button("✏ Hernoemen").clicked() {
+        actions.rename_entry = Some(entry.path().to_path_buf());
+        ui.close_menu();
+    }
+    if ui.button("🗑 Verwijderen").clicked() {
+        actions.delete_entry = Some(entry.path().to_path_buf());
+        ui.close_menu();
+    }
+    if entry.is_dir {
+        ui.separator();
+        if ui.button("ℹ Eigenschappen").clicked() {
+            actions.properties_entry = Some(entry.path().to_path_buf());
+            ui.close_menu();
+        }
+    }
+}
+
+fn handle_entry_click(entry: &crate::fs_model::FsEntry, response: &egui::Response, actions: &mut CenterListActions) {
+    if response.clicked() {
+        if entry.is_dir {
+            actions.clicked_dir = Some(entry.path().to_path_buf());
+        } else {
+            actions.clicked_file = Some(entry.path().to_path_buf());
+        }
+    }
+    if response.double_clicked() && entry.is_dir {
+        actions.clicked_dir = Some(entry.path().to_path_buf());
+    }
+}
+
 pub struct AssetViewerApp {
     config_store: ConfigStore,
     config: AppConfig,
@@ -123,6 +188,10 @@ pub struct AssetViewerApp {
     // Properties dialog
     properties_path: Option<PathBuf>,
     properties_info: Option<FolderProperties>,
+    properties_scan_rx: Option<std::sync::mpsc::Receiver<FolderProperties>>,
+
+    // Error feedback for file/folder operations
+    op_error: Option<String>,
 
     // Stored context for background threads
     ctx: egui::Context,
@@ -150,6 +219,15 @@ impl AssetViewerApp {
 
         let audio_stream = rodio::OutputStream::try_default().ok();
 
+        let sort_mode = match config.sort_mode.as_str() {
+            "Type" => SortMode::Type,
+            "Date" => SortMode::Date,
+            "Size" => SortMode::Size,
+            _ => SortMode::Name,
+        };
+        let sort_ascending = config.sort_ascending;
+        let view_mode = if config.view_mode == "Grid" { ViewMode::Grid } else { ViewMode::List };
+
         let mut app = Self {
             config_store,
             config,
@@ -168,9 +246,9 @@ impl AssetViewerApp {
             new_favorite_path: PathBuf::new(),
             search_query: String::new(),
             address_bar,
-            sort_mode: SortMode::Name,
-            sort_ascending: true,
-            view_mode: ViewMode::List,
+            sort_mode,
+            sort_ascending,
+            view_mode,
             thumbnail_cache: std::collections::HashMap::new(),
             thumbnail_rx: None,
             cache_status: None,
@@ -185,6 +263,8 @@ impl AssetViewerApp {
             file_delete_path: None,
             properties_path: None,
             properties_info: None,
+            properties_scan_rx: None,
+            op_error: None,
             ctx: cc.egui_ctx.clone(),
         };
         app.load_thumbnails();
@@ -217,6 +297,19 @@ impl AssetViewerApp {
 
     fn save_config(&self) {
         let _ = self.config_store.save(&self.config);
+    }
+
+    fn start_properties_scan(&mut self, path: PathBuf) {
+        self.properties_path = Some(path.clone());
+        self.properties_info = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.properties_scan_rx = Some(rx);
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let props = FolderProperties::scan(&path);
+            let _ = tx.send(props);
+            ctx.request_repaint();
+        });
     }
 
     fn unique_favorite_name(
@@ -252,6 +345,10 @@ impl AssetViewerApp {
 
     fn refresh_selected_dir(&mut self) {
         self.entries = crate::fs_model::list_dir_entries(&self.selected_dir).unwrap_or_default();
+        // Evict thumbnails that belong to a different directory
+        let current_paths: std::collections::HashSet<&PathBuf> =
+            self.entries.iter().map(|e| &e.path).collect();
+        self.thumbnail_cache.retain(|k, _| current_paths.contains(k));
         self.load_thumbnails();
         self.apply_filters();
     }
@@ -319,27 +416,22 @@ impl AssetViewerApp {
             .collect();
 
         filtered.sort_by(|a, b| {
+            // Directories always come first for name/type sorts
+            if matches!(self.sort_mode, SortMode::Name | SortMode::Type) {
+                match (a.is_dir, b.is_dir) {
+                    (true, false) => return std::cmp::Ordering::Less,
+                    (false, true) => return std::cmp::Ordering::Greater,
+                    _ => {}
+                }
+            }
             let ord = match self.sort_mode {
                 SortMode::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                 SortMode::Type => a.extension.cmp(&b.extension),
                 SortMode::Date => a.modified.cmp(&b.modified),
                 SortMode::Size => a.size.cmp(&b.size),
             };
-            if self.sort_ascending {
-                ord
-            } else {
-                ord.reverse()
-            }
+            if self.sort_ascending { ord } else { ord.reverse() }
         });
-
-        // Always keep directories first if sorting by name or type
-        if self.sort_mode == SortMode::Name || self.sort_mode == SortMode::Type {
-            filtered.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => std::cmp::Ordering::Equal,
-            });
-        }
 
         self.filtered_entries = filtered;
     }
@@ -463,11 +555,22 @@ impl AssetViewerApp {
                 if ui.button("Export Selected…").clicked() {
                     if let Some(path) = self.selected_file.clone() {
                         if let Some(target_dir) = rfd::FileDialog::new().pick_folder() {
-                            let _ = crate::fs_model::export_asset(
+                            match crate::fs_model::export_asset(
                                 &path,
                                 &target_dir,
                                 self.config.flatten_export,
-                            );
+                            ) {
+                                Ok(warnings) if !warnings.is_empty() => {
+                                    self.op_error = Some(format!(
+                                        "Export voltooid met waarschuwingen:\n{}",
+                                        warnings.join("\n")
+                                    ));
+                                }
+                                Err(e) => {
+                                    self.op_error = Some(format!("Export mislukt: {e:#}"));
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -567,8 +670,7 @@ impl AssetViewerApp {
                             self.folder_delete_path = Some(path);
                         }
                         FolderAction::Properties(path) => {
-                            self.properties_info = Some(FolderProperties::scan(&path));
-                            self.properties_path = Some(path);
+                            self.start_properties_scan(path);
                         }
                     }
                 }
@@ -595,81 +697,43 @@ impl AssetViewerApp {
 
             ui.horizontal(|ui| {
                 ui.label("Sort:");
-                if ui
-                    .selectable_label(self.sort_mode == SortMode::Name, "Name")
-                    .clicked()
-                {
-                    if self.sort_mode == SortMode::Name {
-                        self.sort_ascending = !self.sort_ascending;
-                    } else {
-                        self.sort_mode = SortMode::Name;
-                        self.sort_ascending = true;
+                for (label, mode, key) in [
+                    ("Name", SortMode::Name, "Name"),
+                    ("Type", SortMode::Type, "Type"),
+                    ("Size", SortMode::Size, "Size"),
+                    ("Date", SortMode::Date, "Date"),
+                ] {
+                    if ui.selectable_label(self.sort_mode == mode, label).clicked() {
+                        if self.sort_mode == mode {
+                            self.sort_ascending = !self.sort_ascending;
+                        } else {
+                            self.sort_mode = mode;
+                            self.sort_ascending = true;
+                        }
+                        self.config.sort_mode = key.to_string();
+                        self.config.sort_ascending = self.sort_ascending;
+                        self.save_config();
+                        self.apply_filters();
                     }
-                    self.apply_filters();
-                }
-                if ui
-                    .selectable_label(self.sort_mode == SortMode::Type, "Type")
-                    .clicked()
-                {
-                    if self.sort_mode == SortMode::Type {
-                        self.sort_ascending = !self.sort_ascending;
-                    } else {
-                        self.sort_mode = SortMode::Type;
-                        self.sort_ascending = true;
-                    }
-                    self.apply_filters();
-                }
-                if ui
-                    .selectable_label(self.sort_mode == SortMode::Size, "Size")
-                    .clicked()
-                {
-                    if self.sort_mode == SortMode::Size {
-                        self.sort_ascending = !self.sort_ascending;
-                    } else {
-                        self.sort_mode = SortMode::Size;
-                        self.sort_ascending = true;
-                    }
-                    self.apply_filters();
-                }
-                if ui
-                    .selectable_label(self.sort_mode == SortMode::Date, "Date")
-                    .clicked()
-                {
-                    if self.sort_mode == SortMode::Date {
-                        self.sort_ascending = !self.sort_ascending;
-                    } else {
-                        self.sort_mode = SortMode::Date;
-                        self.sort_ascending = true;
-                    }
-                    self.apply_filters();
                 }
 
                 ui.separator();
                 ui.label("View:");
-                if ui
-                    .selectable_label(self.view_mode == ViewMode::List, "☰ List")
-                    .clicked()
-                {
+                if ui.selectable_label(self.view_mode == ViewMode::List, "☰ List").clicked() {
                     self.view_mode = ViewMode::List;
+                    self.config.view_mode = "List".to_string();
+                    self.save_config();
                 }
-                if ui
-                    .selectable_label(self.view_mode == ViewMode::Grid, "▦ Grid")
-                    .clicked()
-                {
+                if ui.selectable_label(self.view_mode == ViewMode::Grid, "▦ Grid").clicked() {
                     self.view_mode = ViewMode::Grid;
+                    self.config.view_mode = "Grid".to_string();
+                    self.save_config();
                 }
             });
 
             ui.separator();
 
-            let mut clicked_dir = None;
-            let mut clicked_file = None;
-            let mut open_explorer = None;
-            let mut copy_path = None;
-            let mut rename_entry: Option<PathBuf> = None;
-            let mut delete_entry: Option<PathBuf> = None;
-            let mut new_folder_in: Option<PathBuf> = None;
-            let mut properties_entry: Option<PathBuf> = None;
+            let mut actions = CenterListActions::default();
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if self.view_mode == ViewMode::List {
@@ -687,57 +751,8 @@ impl AssetViewerApp {
                         };
 
                         let response = ui.selectable_label(is_selected, label);
-
-                        response.context_menu(|ui| {
-                            if ui.button("Open").clicked() {
-                                if entry.is_dir {
-                                    clicked_dir = Some(entry.path().to_path_buf());
-                                } else {
-                                    clicked_file = Some(entry.path().to_path_buf());
-                                }
-                                ui.close_menu();
-                            }
-                            if ui.button("Open in Explorer").clicked() {
-                                open_explorer = Some(entry.path().to_path_buf());
-                                ui.close_menu();
-                            }
-                            if ui.button("Copy Path").clicked() {
-                                copy_path = Some(entry.path().to_string_lossy().to_string());
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            if entry.is_dir && ui.button("📁 Nieuwe map").clicked() {
-                                new_folder_in = Some(entry.path().to_path_buf());
-                                ui.close_menu();
-                            }
-                            if ui.button("✏ Hernoemen").clicked() {
-                                rename_entry = Some(entry.path().to_path_buf());
-                                ui.close_menu();
-                            }
-                            if ui.button("🗑 Verwijderen").clicked() {
-                                delete_entry = Some(entry.path().to_path_buf());
-                                ui.close_menu();
-                            }
-                            if entry.is_dir {
-                                ui.separator();
-                                if ui.button("ℹ Eigenschappen").clicked() {
-                                    properties_entry = Some(entry.path().to_path_buf());
-                                    ui.close_menu();
-                                }
-                            }
-                        });
-
-                        if response.clicked() {
-                            if entry.is_dir {
-                                clicked_dir = Some(entry.path().to_path_buf());
-                            } else {
-                                clicked_file = Some(entry.path().to_path_buf());
-                            }
-                        }
-
-                        if response.double_clicked() && entry.is_dir {
-                            clicked_dir = Some(entry.path().to_path_buf());
-                        }
+                        response.context_menu(|ui| populate_entry_context_menu(ui, entry, &mut actions));
+                        handle_entry_click(entry, &response, &mut actions);
                     }
                 } else {
                     // Grid View
@@ -765,7 +780,6 @@ impl AssetViewerApp {
                                     );
                                 }
 
-                                // Draw thumbnail or icon
                                 let thumb_rect = egui::Rect::from_min_size(
                                     rect.min + egui::vec2(10.0, 5.0),
                                     egui::vec2(80.0, 80.0),
@@ -791,7 +805,6 @@ impl AssetViewerApp {
                                     );
                                 }
 
-                                // Draw name
                                 let name_rect = egui::Rect::from_min_max(
                                     egui::pos2(rect.min.x, rect.min.y + 90.0),
                                     rect.max,
@@ -805,68 +818,20 @@ impl AssetViewerApp {
                                 );
                             }
 
-                            response.context_menu(|ui| {
-                                if ui.button("Open").clicked() {
-                                    if entry.is_dir {
-                                        clicked_dir = Some(entry.path().to_path_buf());
-                                    } else {
-                                        clicked_file = Some(entry.path().to_path_buf());
-                                    }
-                                    ui.close_menu();
-                                }
-                                if ui.button("Open in Explorer").clicked() {
-                                    open_explorer = Some(entry.path().to_path_buf());
-                                    ui.close_menu();
-                                }
-                                if ui.button("Copy Path").clicked() {
-                                    copy_path = Some(entry.path().to_string_lossy().to_string());
-                                    ui.close_menu();
-                                }
-                                ui.separator();
-                                if entry.is_dir && ui.button("📁 Nieuwe map").clicked() {
-                                    new_folder_in = Some(entry.path().to_path_buf());
-                                    ui.close_menu();
-                                }
-                                if ui.button("✏ Hernoemen").clicked() {
-                                    rename_entry = Some(entry.path().to_path_buf());
-                                    ui.close_menu();
-                                }
-                                if ui.button("🗑 Verwijderen").clicked() {
-                                    delete_entry = Some(entry.path().to_path_buf());
-                                    ui.close_menu();
-                                }
-                                if entry.is_dir {
-                                    ui.separator();
-                                    if ui.button("ℹ Eigenschappen").clicked() {
-                                        properties_entry = Some(entry.path().to_path_buf());
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-
-                            if response.clicked() {
-                                if entry.is_dir {
-                                    clicked_dir = Some(entry.path().to_path_buf());
-                                } else {
-                                    clicked_file = Some(entry.path().to_path_buf());
-                                }
-                            }
-
-                            if response.double_clicked() && entry.is_dir {
-                                clicked_dir = Some(entry.path().to_path_buf());
-                            }
+                            response.context_menu(|ui| populate_entry_context_menu(ui, entry, &mut actions));
+                            handle_entry_click(entry, &response, &mut actions);
                         }
                     });
                 }
             });
 
-            if let Some(dir) = clicked_dir {
+            if let Some(dir) = actions.clicked_dir {
                 self.select_dir(dir);
-            } else if let Some(file) = clicked_file {
+            } else if let Some(file) = actions.clicked_file {
                 self.select_file(file);
             }
 
-            if let Some(path) = open_explorer {
+            if let Some(path) = actions.open_explorer {
                 #[cfg(target_os = "windows")]
                 {
                     let _ = std::process::Command::new("explorer")
@@ -876,15 +841,15 @@ impl AssetViewerApp {
                 }
             }
 
-            if let Some(path) = copy_path {
+            if let Some(path) = actions.copy_path {
                 ui.output_mut(|o| o.copied_text = path);
             }
 
-            if let Some(parent) = new_folder_in {
+            if let Some(parent) = actions.new_folder_in {
                 self.folder_new_name = "Nieuwe map".to_string();
                 self.folder_new_parent = Some(parent);
             }
-            if let Some(path) = rename_entry {
+            if let Some(path) = actions.rename_entry {
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -897,16 +862,15 @@ impl AssetViewerApp {
                     self.file_rename_path = Some(path);
                 }
             }
-            if let Some(path) = delete_entry {
+            if let Some(path) = actions.delete_entry {
                 if path.is_dir() {
                     self.folder_delete_path = Some(path);
                 } else {
                     self.file_delete_path = Some(path);
                 }
             }
-            if let Some(path) = properties_entry {
-                self.properties_info = Some(FolderProperties::scan(&path));
-                self.properties_path = Some(path);
+            if let Some(path) = actions.properties_entry {
+                self.start_properties_scan(path);
             }
         });
     }
@@ -1127,11 +1091,14 @@ impl AssetViewerApp {
                     let re = ui.text_edit_singleline(&mut self.folder_new_name);
                     if re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         let new_path = parent.join(&self.folder_new_name);
-                        if let Ok(()) = std::fs::create_dir(&new_path) {
-                            self.tree.reload_at(&parent);
-                            if self.selected_dir == parent {
-                                self.refresh_selected_dir();
+                        match std::fs::create_dir(&new_path) {
+                            Ok(()) => {
+                                self.tree.reload_at(&parent);
+                                if self.selected_dir == parent {
+                                    self.refresh_selected_dir();
+                                }
                             }
+                            Err(e) => self.op_error = Some(format!("Kan map niet aanmaken: {e}")),
                         }
                         self.folder_new_parent = None;
                     }
@@ -1139,11 +1106,14 @@ impl AssetViewerApp {
                 ui.horizontal(|ui| {
                     if ui.button("Aanmaken").clicked() {
                         let new_path = parent.join(&self.folder_new_name);
-                        if let Ok(()) = std::fs::create_dir(&new_path) {
-                            self.tree.reload_at(&parent);
-                            if self.selected_dir == parent {
-                                self.refresh_selected_dir();
+                        match std::fs::create_dir(&new_path) {
+                            Ok(()) => {
+                                self.tree.reload_at(&parent);
+                                if self.selected_dir == parent {
+                                    self.refresh_selected_dir();
+                                }
                             }
+                            Err(e) => self.op_error = Some(format!("Kan map niet aanmaken: {e}")),
                         }
                         self.folder_new_parent = None;
                     }
@@ -1194,13 +1164,16 @@ impl AssetViewerApp {
     fn do_folder_rename(&mut self, old_path: &Path) {
         if let Some(parent) = old_path.parent() {
             let new_path = parent.join(&self.folder_rename_name);
-            if let Ok(()) = std::fs::rename(old_path, &new_path) {
-                self.tree.reload_at(parent);
-                if self.selected_dir == old_path {
-                    self.select_dir(new_path);
-                } else if self.selected_dir == parent {
-                    self.refresh_selected_dir();
+            match std::fs::rename(old_path, &new_path) {
+                Ok(()) => {
+                    self.tree.reload_at(parent);
+                    if self.selected_dir == old_path {
+                        self.select_dir(new_path);
+                    } else if self.selected_dir == parent {
+                        self.refresh_selected_dir();
+                    }
                 }
+                Err(e) => self.op_error = Some(format!("Kan map niet hernoemen: {e}")),
             }
         }
         self.folder_rename_path = None;
@@ -1227,13 +1200,19 @@ impl AssetViewerApp {
                 ui.horizontal(|ui| {
                     if ui.button("Verwijderen").clicked() {
                         if let Some(parent) = path.parent() {
-                            if let Ok(()) = std::fs::remove_dir_all(&path) {
-                                self.tree.reload_at(parent);
-                                if self.selected_dir == path || self.selected_dir.starts_with(&path)
-                                {
-                                    self.select_dir(parent.to_path_buf());
-                                } else if self.selected_dir == parent {
-                                    self.refresh_selected_dir();
+                            match std::fs::remove_dir_all(&path) {
+                                Ok(()) => {
+                                    self.tree.reload_at(parent);
+                                    if self.selected_dir == path
+                                        || self.selected_dir.starts_with(&path)
+                                    {
+                                        self.select_dir(parent.to_path_buf());
+                                    } else if self.selected_dir == parent {
+                                        self.refresh_selected_dir();
+                                    }
+                                }
+                                Err(e) => {
+                                    self.op_error = Some(format!("Kan map niet verwijderen: {e}"))
                                 }
                             }
                         }
@@ -1268,11 +1247,17 @@ impl AssetViewerApp {
                     if re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         if let Some(parent) = old_path.parent() {
                             let new_path = parent.join(&self.file_rename_name);
-                            if std::fs::rename(&old_path, &new_path).is_ok() {
-                                if self.selected_file.as_ref() == Some(&old_path) {
-                                    self.selected_file = Some(new_path);
+                            match std::fs::rename(&old_path, &new_path) {
+                                Ok(()) => {
+                                    if self.selected_file.as_ref() == Some(&old_path) {
+                                        self.selected_file = Some(new_path);
+                                    }
+                                    self.refresh_selected_dir();
                                 }
-                                self.refresh_selected_dir();
+                                Err(e) => {
+                                    self.op_error =
+                                        Some(format!("Kan bestand niet hernoemen: {e}"))
+                                }
                             }
                         }
                         self.file_rename_path = None;
@@ -1282,11 +1267,17 @@ impl AssetViewerApp {
                     if ui.button("Hernoemen").clicked() {
                         if let Some(parent) = old_path.parent() {
                             let new_path = parent.join(&self.file_rename_name);
-                            if std::fs::rename(&old_path, &new_path).is_ok() {
-                                if self.selected_file.as_ref() == Some(&old_path) {
-                                    self.selected_file = Some(new_path);
+                            match std::fs::rename(&old_path, &new_path) {
+                                Ok(()) => {
+                                    if self.selected_file.as_ref() == Some(&old_path) {
+                                        self.selected_file = Some(new_path);
+                                    }
+                                    self.refresh_selected_dir();
                                 }
-                                self.refresh_selected_dir();
+                                Err(e) => {
+                                    self.op_error =
+                                        Some(format!("Kan bestand niet hernoemen: {e}"))
+                                }
                             }
                         }
                         self.file_rename_path = None;
@@ -1318,21 +1309,24 @@ impl AssetViewerApp {
                 ui.horizontal(|ui| {
                     if ui.button("Verwijderen").clicked() {
                         let is_dir = path.is_dir();
-                        let ok = if is_dir {
-                            std::fs::remove_dir_all(&path).is_ok()
+                        let result = if is_dir {
+                            std::fs::remove_dir_all(&path)
                         } else {
-                            std::fs::remove_file(&path).is_ok()
+                            std::fs::remove_file(&path)
                         };
-                        if ok {
-                            if self.selected_file.as_ref() == Some(&path) {
-                                self.selected_file = None;
-                            }
-                            self.refresh_selected_dir();
-                            if is_dir {
-                                if let Some(parent) = path.parent() {
-                                    self.tree.reload_at(parent);
+                        match result {
+                            Ok(()) => {
+                                if self.selected_file.as_ref() == Some(&path) {
+                                    self.selected_file = None;
+                                }
+                                self.refresh_selected_dir();
+                                if is_dir {
+                                    if let Some(parent) = path.parent() {
+                                        self.tree.reload_at(parent);
+                                    }
                                 }
                             }
+                            Err(e) => self.op_error = Some(format!("Kan niet verwijderen: {e}")),
                         }
                         self.file_delete_path = None;
                     }
@@ -1348,9 +1342,6 @@ impl AssetViewerApp {
 
     fn render_properties_dialog(&mut self, ctx: &Context) {
         let Some(path) = self.properties_path.clone() else {
-            return;
-        };
-        let Some(info) = self.properties_info.clone() else {
             return;
         };
 
@@ -1369,63 +1360,88 @@ impl AssetViewerApp {
                 ui.monospace(path.to_string_lossy().to_string());
                 ui.separator();
 
-                egui::Grid::new("properties_grid")
-                    .num_columns(2)
-                    .spacing([20.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("Totale grootte:");
-                        ui.label(format_size(info.total_size));
-                        ui.end_row();
-
-                        ui.label("Bestanden:");
-                        ui.label(format!("{}", info.file_count));
-                        ui.end_row();
-
-                        ui.label("Mappen:");
-                        ui.label(format!("{}", info.folder_count));
-                        ui.end_row();
-
-                        ui.label("Lege mappen:");
-                        ui.label(format!("{}", info.empty_folders.len()));
-                        ui.end_row();
-                    });
-
-                if !info.empty_folders.is_empty() {
-                    ui.separator();
-                    ui.label(RichText::new("Lege mappen:").strong());
-                    egui::ScrollArea::vertical()
-                        .max_height(200.0)
-                        .id_source("empty_folders_scroll")
+                if let Some(info) = self.properties_info.clone() {
+                    egui::Grid::new("properties_grid")
+                        .num_columns(2)
+                        .spacing([20.0, 4.0])
                         .show(ui, |ui| {
-                            for folder in &info.empty_folders {
-                                let rel = folder.strip_prefix(&path).unwrap_or(folder);
-                                ui.label(format!("  📁 {}", rel.display()));
-                            }
+                            ui.label("Totale grootte:");
+                            ui.label(format_size(info.total_size));
+                            ui.end_row();
+
+                            ui.label("Bestanden:");
+                            ui.label(format!("{}", info.file_count));
+                            ui.end_row();
+
+                            ui.label("Mappen:");
+                            ui.label(format!("{}", info.folder_count));
+                            ui.end_row();
+
+                            ui.label("Lege mappen:");
+                            ui.label(format!("{}", info.empty_folders.len()));
+                            ui.end_row();
                         });
 
-                    if ui.button("🗑 Lege mappen verwijderen").clicked() {
-                        for folder in &info.empty_folders {
-                            let _ = std::fs::remove_dir(folder);
-                        }
-                        // Rescan
-                        self.properties_info = Some(FolderProperties::scan(&path));
-                        self.tree.reload_at(&path);
-                        if self.selected_dir == path || self.selected_dir.starts_with(&path) {
-                            self.refresh_selected_dir();
+                    if !info.empty_folders.is_empty() {
+                        ui.separator();
+                        ui.label(RichText::new("Lege mappen:").strong());
+                        egui::ScrollArea::vertical()
+                            .max_height(200.0)
+                            .id_source("empty_folders_scroll")
+                            .show(ui, |ui| {
+                                for folder in &info.empty_folders {
+                                    let rel = folder.strip_prefix(&path).unwrap_or(folder);
+                                    ui.label(format!("  📁 {}", rel.display()));
+                                }
+                            });
+
+                        if ui.button("🗑 Lege mappen verwijderen").clicked() {
+                            for folder in &info.empty_folders {
+                                let _ = std::fs::remove_dir(folder);
+                            }
+                            self.tree.reload_at(&path);
+                            if self.selected_dir == path || self.selected_dir.starts_with(&path) {
+                                self.refresh_selected_dir();
+                            }
+                            self.start_properties_scan(path.clone());
                         }
                     }
-                }
 
-                ui.separator();
-                if ui.button("Vernieuwen").clicked() {
-                    self.properties_info = Some(FolderProperties::scan(&path));
+                    ui.separator();
+                    if ui.button("Vernieuwen").clicked() {
+                        self.start_properties_scan(path.clone());
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Bezig met laden…");
+                    });
+                    ctx.request_repaint();
                 }
             });
 
         if !open {
             self.properties_path = None;
             self.properties_info = None;
+            self.properties_scan_rx = None;
         }
+    }
+
+    fn render_op_error_dialog(&mut self, ctx: &Context) {
+        let Some(err) = self.op_error.clone() else {
+            return;
+        };
+        egui::Window::new("Fout")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.colored_label(egui::Color32::from_rgb(255, 120, 120), &err);
+                ui.add_space(8.0);
+                if ui.button("OK").clicked() {
+                    self.op_error = None;
+                }
+            });
     }
 
     fn render_add_favorite_modal(&mut self, ctx: &Context) {
@@ -1496,6 +1512,15 @@ mod tests {
 impl eframe::App for AssetViewerApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.handle_mouse_navigation(ctx);
+
+        // Drain async properties scan result
+        if let Some(rx) = &self.properties_scan_rx {
+            if let Ok(props) = rx.try_recv() {
+                self.properties_info = Some(props);
+                self.properties_scan_rx = None;
+            }
+        }
+
         // Drain thumbnail results from background thread
         if let Some(rx) = &self.thumbnail_rx {
             let mut done = false;
@@ -1532,5 +1557,6 @@ impl eframe::App for AssetViewerApp {
         self.render_file_rename_dialog(ctx);
         self.render_file_delete_dialog(ctx);
         self.render_properties_dialog(ctx);
+        self.render_op_error_dialog(ctx);
     }
 }

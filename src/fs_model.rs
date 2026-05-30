@@ -302,8 +302,8 @@ mod tests {
 }
 
 /// Export asset with dependency discovery.
-/// Scans for textures and sidecar files based on the primary asset stem.
-pub fn export_asset(file: &Path, target_dir: &Path, flatten: bool) -> anyhow::Result<()> {
+/// Returns a list of warning strings for sidecars that could not be copied.
+pub fn export_asset(file: &Path, target_dir: &Path, flatten: bool) -> anyhow::Result<Vec<String>> {
     fs::create_dir_all(target_dir)
         .with_context(|| format!("Creating export dir: {}", target_dir.display()))?;
 
@@ -317,8 +317,10 @@ pub fn export_asset(file: &Path, target_dir: &Path, flatten: bool) -> anyhow::Re
     let parent = file.parent().unwrap_or_else(|| Path::new("."));
     let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     if stem.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
+
+    let mut warnings: Vec<String> = Vec::new();
 
     // Dependency discovery:
     let sidecar_exts = [
@@ -330,8 +332,10 @@ pub fn export_asset(file: &Path, target_dir: &Path, flatten: bool) -> anyhow::Re
     for ext in &sidecar_exts {
         let side = parent.join(format!("{stem}.{ext}"));
         if side.exists() && side != file {
-            let dest_side = target_dir.join(side.file_name().unwrap());
-            let _ = fs::copy(&side, &dest_side);
+            let dest_side = target_dir.join(side.file_name().expect("sidecar has filename"));
+            if let Err(e) = fs::copy(&side, &dest_side) {
+                warnings.push(format!("Kon niet kopiëren {}: {e}", side.display()));
+            }
         }
 
         // Suffix matches like _diffuse, _normal, etc.
@@ -342,8 +346,10 @@ pub fn export_asset(file: &Path, target_dir: &Path, flatten: bool) -> anyhow::Re
         for suffix in suffixes {
             let side = parent.join(format!("{stem}{suffix}.{ext}"));
             if side.exists() {
-                let dest_side = target_dir.join(side.file_name().unwrap());
-                let _ = fs::copy(&side, &dest_side);
+                let dest_side = target_dir.join(side.file_name().expect("sidecar has filename"));
+                if let Err(e) = fs::copy(&side, &dest_side) {
+                    warnings.push(format!("Kon niet kopiëren {}: {e}", side.display()));
+                }
             }
         }
     }
@@ -365,14 +371,16 @@ pub fn export_asset(file: &Path, target_dir: &Path, flatten: bool) -> anyhow::Re
                             d
                         };
                         let dest_file = final_dest_dir.join(entry.file_name());
-                        let _ = fs::copy(&p, &dest_file);
+                        if let Err(e) = fs::copy(&p, &dest_file) {
+                            warnings.push(format!("Kon niet kopiëren {}: {e}", p.display()));
+                        }
                     }
                 }
             }
         }
     }
 
-    Ok(())
+    Ok(warnings)
 }
 
 #[cfg(target_os = "windows")]
